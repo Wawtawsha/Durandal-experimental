@@ -1,39 +1,41 @@
 {
   "wave1": {
-    "started": null,
+    "started": "2024-11-13T14:00:00Z",
+    "completed": "2024-11-13T15:51:00Z",
     "sessions": {
       "task-001a": {
-        "status": "pending",
+        "status": "completed",
         "session_id": "1A",
-        "branch": "task-001a-gof-patterns",
+        "branch": "claude/session-1a-parallel-01L5DMjgAqf5FWyW9fRJSuDE",
         "description": "Gang of Four patterns",
-        "started": null,
-        "completed": null
+        "started": "2024-11-13T14:00:00Z",
+        "completed": "2024-11-13T15:30:00Z"
       },
       "task-001b": {
-        "status": "pending",
+        "status": "completed",
         "session_id": "1B",
-        "branch": "task-001b-integration-patterns",
+        "branch": "claude/session-1a-parallel-01MqLuAxeyBuiDLK6BRW9vCe",
         "description": "Enterprise Integration patterns",
-        "started": null,
-        "completed": null
+        "started": "2024-11-13T14:00:00Z",
+        "completed": "2024-11-13T15:30:00Z"
       },
       "task-001c": {
-        "status": "pending",
+        "status": "completed",
         "session_id": "1C",
-        "branch": "task-001c-data-patterns",
+        "branch": "claude/session-1a-parallel-016YReQLpHWyv9TcbB9VqYgC",
         "description": "Data pipeline patterns",
-        "started": null,
-        "completed": null
+        "started": "2024-11-13T14:00:00Z",
+        "completed": "2024-11-13T15:30:00Z"
       }
     }
   },
   "wave2": {
     "started": null,
-    "blocked_by": ["wave1"],
+    "blocked_by": [],
+    "ready": true,
     "sessions": {
       "task-002a": {
-        "status": "blocked",
+        "status": "ready",
         "session_id": "2A",
         "branch": "task-002a-microsoft-standards",
         "description": "Microsoft/Azure standards",
@@ -41,7 +43,7 @@
         "completed": null
       },
       "task-002b": {
-        "status": "blocked",
+        "status": "ready",
         "session_id": "2B",
         "branch": "task-002b-etl-standards",
         "description": "General ETL standards",

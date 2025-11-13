@@ -1,0 +1,141 @@
+{
+  "wave1": {
+    "started": null,
+    "sessions": {
+      "task-001a": {
+        "status": "pending",
+        "session_id": "1A",
+        "branch": "task-001a-gof-patterns",
+        "description": "Gang of Four patterns",
+        "started": null,
+        "completed": null
+      },
+      "task-001b": {
+        "status": "pending",
+        "session_id": "1B",
+        "branch": "task-001b-integration-patterns",
+        "description": "Enterprise Integration patterns",
+        "started": null,
+        "completed": null
+      },
+      "task-001c": {
+        "status": "pending",
+        "session_id": "1C",
+        "branch": "task-001c-data-patterns",
+        "description": "Data pipeline patterns",
+        "started": null,
+        "completed": null
+      }
+    }
+  },
+  "wave2": {
+    "started": null,
+    "blocked_by": ["wave1"],
+    "sessions": {
+      "task-002a": {
+        "status": "blocked",
+        "session_id": "2A",
+        "branch": "task-002a-microsoft-standards",
+        "description": "Microsoft/Azure standards",
+        "started": null,
+        "completed": null
+      },
+      "task-002b": {
+        "status": "blocked",
+        "session_id": "2B",
+        "branch": "task-002b-etl-standards",
+        "description": "General ETL standards",
+        "started": null,
+        "completed": null
+      }
+    }
+  },
+  "wave3": {
+    "started": null,
+    "blocked_by": ["wave1", "wave2"],
+    "sessions": {
+      "task-003a": {
+        "status": "blocked",
+        "session_id": "3A",
+        "branch": "task-003a-structure-analysis",
+        "description": "Pipeline structure analysis",
+        "started": null,
+        "completed": null
+      },
+      "task-003b": {
+        "status": "blocked",
+        "session_id": "3B",
+        "branch": "task-003b-parameter-extraction",
+        "description": "Parameter identification",
+        "started": null,
+        "completed": null
+      },
+      "task-003c": {
+        "status": "blocked",
+        "session_id": "3C",
+        "branch": "task-003c-pattern-mapping",
+        "description": "Pattern mapping",
+        "started": null,
+        "completed": null
+      }
+    }
+  },
+  "wave4": {
+    "started": null,
+    "blocked_by": ["wave3"],
+    "sessions": {
+      "task-004a": {
+        "status": "blocked",
+        "session_id": "4A",
+        "branch": "task-004a-parameter-extraction",
+        "description": "Parameter extraction logic",
+        "started": null,
+        "completed": null
+      },
+      "task-004b": {
+        "status": "blocked",
+        "session_id": "4B",
+        "branch": "task-004b-template-structure",
+        "description": "Pattern template structure",
+        "started": null,
+        "completed": null
+      }
+    }
+  },
+  "wave5": {
+    "started": null,
+    "blocked_by": ["wave4"],
+    "sessions": {
+      "task-005": {
+        "status": "blocked",
+        "session_id": "5A",
+        "branch": "task-005-durandal-storage",
+        "description": "Durandal integration",
+        "started": null,
+        "completed": null
+      },
+      "task-006": {
+        "status": "blocked",
+        "session_id": "5B",
+        "branch": "task-006-combination-logic",
+        "description": "Pattern-parameter combination",
+        "started": null,
+        "completed": null
+      }
+    }
+  },
+  "wave6": {
+    "started": null,
+    "blocked_by": ["wave5"],
+    "sessions": {
+      "task-007": {
+        "status": "blocked",
+        "session_id": "6A",
+        "branch": "task-007-user-prompts",
+        "description": "User prompt engineering",
+        "started": null,
+        "completed": null
+      }
+    }
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "name": "durandal-memory-mcp",
+  "version": "4.0.0-gemini",
+  "description": "Durandal MCP Server - Multi-client AI memory system supporting Claude and Gemini. Persistent, searchable memory with automatic SQLite setup.",
+  "main": "durandal-mcp-server-v3.js",
+  "bin": {
+    "durandal-mcp": "durandal-mcp-server-v3.js",
+    "durandal-assign-projects": "assign-projects.js",
+    "durandal-migrate": "db-migrate.js",
+    "durandal-discover": "db-discovery.js"
+  },
+  "files": [
+    "durandal-mcp-server-v3.js",
+    "db-adapter.js",
+    "mcp-db-client.js",
+    "db-discovery.js",
+    "db-migrate.js",
+    "assign-projects.js",
+    "logger.js",
+    "errors.js",
+    "test-runner.js",
+    "update-checker.js",
+    "transport-factory.js",
+    "protocol-adapter.js",
+    ".env.mcp-minimal",
+    "README.md",
+    "LICENSE",
+    "UPDATE-POLICY.md",
+    "mcp-bundle.json",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "start": "node durandal-mcp-server-v3.js",
+    "start:claude": "MCP_TRANSPORT=stdio node durandal-mcp-server-v3.js",
+    "start:gemini": "MCP_TRANSPORT=http MCP_CLIENT=gemini node durandal-mcp-server-v3.js",
+    "start:hybrid": "MCP_TRANSPORT=hybrid node durandal-mcp-server-v3.js",
+    "test": "node durandal-mcp-server-v3.js --test",
+    "test:transport": "node test-transport.js"
+  },
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "gemini",
+    "google-gemini",
+    "model-context-protocol",
+    "ai-memory",
+    "persistent-memory",
+    "claude",
+    "multi-client",
+    "sqlite",
+    "zero-config",
+    "memory-server",
+    "semantic-search"
+  ],
+  "author": "Enterprise Data and Analytics",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "sqlite3": "^5.1.6",
+    "express": "^4.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Wawtawsha/Durandal-experimental.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Wawtawsha/Durandal-experimental/issues"
+  },
+  "homepage": "https://github.com/Wawtawsha/Durandal-experimental#readme"
+}

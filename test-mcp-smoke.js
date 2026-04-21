@@ -191,6 +191,65 @@ async function runSmoke() {
             failures.push('search_memories did not reject non-numeric importance_min');
         }
 
+        // 10. Phase 3 hardening: metadata must be an object
+        const badMetaShape = await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'x', metadata: 'this is a string' }
+        });
+        const badMetaShapeText = badMetaShape.result?.content?.[0]?.text || '';
+        if (!badMetaShapeText.includes('Metadata must be an object')) {
+            failures.push('store_memory accepted non-object metadata');
+        }
+
+        // 11. Phase 3 hardening: categories must be array of strings
+        const badCategories = await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'x', metadata: { categories: 'not-an-array' } }
+        });
+        const badCategoriesText = badCategories.result?.content?.[0]?.text || '';
+        if (!badCategoriesText.includes('metadata.categories must be an array')) {
+            failures.push('store_memory accepted non-array categories');
+        }
+
+        // 12. Phase 3 hardening: circular metadata caught with a clear error
+        // (We can't actually send circular JSON over JSON-RPC — it can't be
+        // serialized by the client. But we can send a massive object to hit
+        // the size cap.)
+        const hugeMeta = {};
+        for (let i = 0; i < 5000; i++) hugeMeta[`k${i}`] = 'x'.repeat(100);
+        const hugeResp = await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'x', metadata: hugeMeta }
+        });
+        const hugeText = hugeResp.result?.content?.[0]?.text || '';
+        if (!hugeText.includes('metadata exceeds maximum size')) {
+            failures.push('store_memory accepted oversized metadata');
+        }
+
+        // 13. LIKE wildcards in search query don't leak — searching for a unique
+        // marker with % should NOT match unrelated rows. We store two rows:
+        // one with '%', one without, then search for '100%' and check we only
+        // get the one with '100%'.
+        await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'progress is 100% complete', metadata: { project: 'esc' } }
+        });
+        await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'progress is ongoing', metadata: { project: 'esc' } }
+        });
+        const escResp = await send('tools/call', {
+            name: 'search_memories',
+            arguments: { query: '100%', filters: { project: 'esc' } }
+        });
+        const escText = escResp.result?.content?.[0]?.text || '';
+        if (!escText.includes('100% complete')) {
+            failures.push('search_memories did not return the "100% complete" entry');
+        }
+        if (escText.includes('progress is ongoing')) {
+            failures.push('search_memories for "100%" matched an entry without a % sign (escape broken)');
+        }
+
     } catch (err) {
         failures.push(`Exception: ${err.message}`);
     } finally {

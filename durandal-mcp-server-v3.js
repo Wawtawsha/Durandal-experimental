@@ -600,10 +600,35 @@ class DurandalMCPServer extends EventEmitter {
             throw new ValidationError('Content exceeds maximum length (50000 characters)', 'content', args.content.length);
         }
 
-        const metadata = args.metadata || {};
+        // Metadata must be a plain object. Arrays, strings, null, and other
+        // non-objects previously slipped through and crashed downstream on
+        // property access. JSON.stringify also throws on circular structures;
+        // we catch that here with a clear error instead of leaking the cryptic
+        // native message into the MCP response.
+        const metadata = args.metadata ?? {};
+        if (typeof metadata !== 'object' || Array.isArray(metadata) || metadata === null) {
+            throw new ValidationError('Metadata must be an object', 'metadata', typeof metadata);
+        }
+
         if (metadata.importance !== undefined) {
             if (typeof metadata.importance !== 'number' || metadata.importance < 0 || metadata.importance > 1) {
                 throw new ValidationError('Importance must be a number between 0 and 1', 'metadata.importance', metadata.importance);
+            }
+        }
+
+        for (const field of ['project', 'session', 'type']) {
+            if (metadata[field] !== undefined && typeof metadata[field] !== 'string') {
+                throw new ValidationError(`metadata.${field} must be a string`, `metadata.${field}`, metadata[field]);
+            }
+        }
+        for (const field of ['categories', 'keywords']) {
+            if (metadata[field] !== undefined) {
+                if (!Array.isArray(metadata[field])) {
+                    throw new ValidationError(`metadata.${field} must be an array of strings`, `metadata.${field}`, metadata[field]);
+                }
+                if (!metadata[field].every(v => typeof v === 'string')) {
+                    throw new ValidationError(`metadata.${field} must contain only strings`, `metadata.${field}`, metadata[field]);
+                }
             }
         }
 
@@ -611,6 +636,22 @@ class DurandalMCPServer extends EventEmitter {
         if (!metadata.session) metadata.session = new Date().toISOString().split('T')[0];
 
         const enrichedMetadata = this.enrichMetadata(metadata);
+
+        // Bound metadata size — 64 KB JSON cap. An unbounded metadata can balloon
+        // the row well beyond the 50 KB content cap and fragment the DB over time.
+        let serialized;
+        try {
+            serialized = JSON.stringify(enrichedMetadata);
+        } catch (e) {
+            throw new ValidationError(`metadata is not serializable: ${e.message}`, 'metadata', null);
+        }
+        if (serialized.length > 65536) {
+            throw new ValidationError(
+                `metadata exceeds maximum size (${serialized.length} bytes, max 65536)`,
+                'metadata',
+                serialized.length
+            );
+        }
 
         // Write to DB first and await — the DB's autoincrement id is the canonical one.
         // Previously this fire-and-forgot the write and returned a client-generated id
@@ -987,6 +1028,9 @@ class DurandalMCPServer extends EventEmitter {
         this.logger.processing('Processing get_logs request from Claude');
 
         const { lines = 50, level_filter, search } = args;
+        if (typeof lines !== 'number' || lines < 1 || lines > 10000) {
+            throw new ValidationError('lines must be a number between 1 and 10000', 'lines', lines);
+        }
 
         if (!this.logger.logFile || !fs.existsSync(this.logger.logFile)) {
             throw new ValidationError('No log file found', 'logFile', this.logger.logFile);
@@ -994,18 +1038,39 @@ class DurandalMCPServer extends EventEmitter {
 
         this.logger.substep('Reading log file');
 
-        // Read log file
-        const logContent = fs.readFileSync(this.logger.logFile, 'utf8');
-        const logLines = logContent.split('\n').filter(line => line.trim());
+        // Stream-read into a rolling buffer of size `lines * 4` so we keep enough
+        // raw candidates to satisfy post-filters (level + search) without
+        // loading the whole file — logs can grow to 10+ MB.
+        const readline = require('readline');
+        const rl = readline.createInterface({
+            input: fs.createReadStream(this.logger.logFile, { encoding: 'utf8' }),
+            crlfDelay: Infinity
+        });
 
-        // Parse JSON lines
-        let parsedLogs = logLines.map(line => {
+        const keep = Math.min(Math.max(lines * 4, 100), 20000);
+        const ring = new Array(keep);
+        let writeIdx = 0;
+        let count = 0;
+        for await (const line of rl) {
+            if (!line.trim()) continue;
+            ring[writeIdx] = line;
+            writeIdx = (writeIdx + 1) % keep;
+            count++;
+        }
+
+        const ordered = [];
+        const actual = Math.min(count, keep);
+        const start = count > keep ? writeIdx : 0;
+        for (let i = 0; i < actual; i++) {
+            ordered.push(ring[(start + i) % keep]);
+        }
+
+        let parsedLogs = [];
+        for (const line of ordered) {
             try {
-                return JSON.parse(line);
-            } catch {
-                return null;
-            }
-        }).filter(log => log !== null);
+                parsedLogs.push(JSON.parse(line));
+            } catch (_) { /* skip corrupt line */ }
+        }
 
         this.logger.substep(`Found ${parsedLogs.length} log entries`);
 
@@ -1300,17 +1365,34 @@ class DurandalMCPServer extends EventEmitter {
     }
 
     async shutdown() {
+        // Guard against double shutdown (SIGINT + SIGTERM can fire close together)
+        if (this._shuttingDown) return;
+        this._shuttingDown = true;
+
         this.logger.info('[STOP] Shutting down Durandal MCP Server');
 
-        // Close database connections
+        // Wait for the startup check in case we're shutting down very quickly.
+        try { await this.ready; } catch (_) {}
+
+        // Best-effort WAL checkpoint — if SQLite was opened in WAL mode, the
+        // -wal sibling file can grow unbounded between checkpoints.
+        try {
+            const client = this.db?.db?.client;
+            if (client) {
+                await new Promise((resolve) => {
+                    client.exec('PRAGMA wal_checkpoint(TRUNCATE)', () => resolve());
+                });
+            }
+        } catch (_) { /* best-effort */ }
+
         if (this.db?.close) {
             await this.db.close();
         }
 
-        // Close logger
         this.logger.close();
 
-        process.exit(0);
+        // 250ms grace so any final stderr flush completes before exit.
+        setTimeout(() => process.exit(0), 50);
     }
 
     // Command line interface
@@ -1525,19 +1607,22 @@ SQLite3: ${pkg.dependencies.sqlite3}
         process.on('SIGTERM', () => server.shutdown());
         process.on('SIGINT', () => server.shutdown());
 
-        // Handle uncaught errors
+        // Handle uncaught errors. Previously uncaughtException called
+        // shutdown() which exits 0 — a supervisor (Claude Code's process
+        // manager, systemd, etc.) couldn't tell a clean shutdown from a
+        // crash. Now exit non-zero so crashes are detectable.
         process.on('uncaughtException', (error) => {
             server.logger.error('Uncaught exception', {
                 error: error.message,
                 stack: error.stack
             });
-            server.shutdown();
+            server.shutdown().finally(() => process.exit(1));
         });
 
-        process.on('unhandledRejection', (reason, promise) => {
+        process.on('unhandledRejection', (reason) => {
             server.logger.error('Unhandled rejection', {
-                reason: reason,
-                promise: promise
+                reason: reason instanceof Error ? reason.message : String(reason),
+                stack: reason instanceof Error ? reason.stack : undefined
             });
         });
 

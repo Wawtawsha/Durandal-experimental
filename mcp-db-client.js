@@ -213,6 +213,25 @@ class MCPDatabaseClient {
         }
     }
 
+    // Parse metadata from a DB row. Corrupt or externally-edited metadata
+    // previously broke the whole result set because JSON.parse threw up the
+    // outer try/catch and we returned [] for ALL rows. Now one bad row
+    // degrades to empty-metadata for that row and keeps going.
+    _parseRow(row) {
+        let metadata = {};
+        if (row.metadata) {
+            try {
+                metadata = JSON.parse(row.metadata);
+                if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
+                    metadata = {};
+                }
+            } catch (_) {
+                metadata = { _corrupt: true };
+            }
+        }
+        return { id: row.id, content: row.content, metadata, created_at: row.created_at };
+    }
+
     async searchMemories(query, options = {}, limitArg) {
         try {
             await this.ready;
@@ -235,12 +254,7 @@ class MCPDatabaseClient {
             params.push(limit);
 
             const result = await this.query(sql, params);
-            return result.rows.map(row => ({
-                id: row.id,
-                content: row.content,
-                metadata: row.metadata ? JSON.parse(row.metadata) : {},
-                created_at: row.created_at
-            }));
+            return result.rows.map((row) => this._parseRow(row));
         } catch (error) {
             process.stderr.write(`[DB] searchMemories error: ${error.message}\n`);
             return [];
@@ -267,12 +281,7 @@ class MCPDatabaseClient {
             params.push(limit);
 
             const result = await this.query(sql, params);
-            return result.rows.map(row => ({
-                id: row.id,
-                content: row.content,
-                metadata: row.metadata ? JSON.parse(row.metadata) : {},
-                created_at: row.created_at
-            }));
+            return result.rows.map((row) => this._parseRow(row));
         } catch (error) {
             process.stderr.write(`[DB] getRecentMemories error: ${error.message}\n`);
             return [];
@@ -287,13 +296,7 @@ class MCPDatabaseClient {
                 [id]
             );
             if (!result.rows.length) return null;
-            const row = result.rows[0];
-            return {
-                id: row.id,
-                content: row.content,
-                metadata: row.metadata ? JSON.parse(row.metadata) : {},
-                created_at: row.created_at
-            };
+            return this._parseRow(result.rows[0]);
         } catch (error) {
             process.stderr.write(`[DB] getMemoryById error: ${error.message}\n`);
             return null;

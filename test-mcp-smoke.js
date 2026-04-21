@@ -181,33 +181,39 @@ async function runSmoke() {
             failures.push('search_memories importance_min=0.9 returned a 0.7-importance memory (filter not applied)');
         }
 
-        // 9. Invalid importance_min should return a validation error in response text
+        // In SDK 1.29, Zod schemas validate at the MCP-SDK layer and return
+        // isError:true responses with "expected X, received Y" language,
+        // before our handler runs. The test now checks for isError rather
+        // than matching our hand-rolled error text.
+        const isValidationError = (resp, hint) => {
+            const r = resp.result;
+            return r?.isError === true && (hint ? JSON.stringify(r).includes(hint) : true);
+        };
+
+        // 9. Non-numeric importance_min
         const badFilterResp = await send('tools/call', {
             name: 'search_memories',
             arguments: { query: 'anything', filters: { importance_min: 'not-a-number' } }
         });
-        const badFilterText = badFilterResp.result?.content?.[0]?.text || '';
-        if (!badFilterText.includes('importance_min must be a number')) {
+        if (!isValidationError(badFilterResp, 'importance_min')) {
             failures.push('search_memories did not reject non-numeric importance_min');
         }
 
-        // 10. Phase 3 hardening: metadata must be an object
+        // 10. Metadata must be an object (not a string)
         const badMetaShape = await send('tools/call', {
             name: 'store_memory',
             arguments: { content: 'x', metadata: 'this is a string' }
         });
-        const badMetaShapeText = badMetaShape.result?.content?.[0]?.text || '';
-        if (!badMetaShapeText.includes('Metadata must be an object')) {
+        if (!isValidationError(badMetaShape, 'metadata')) {
             failures.push('store_memory accepted non-object metadata');
         }
 
-        // 11. Phase 3 hardening: categories must be array of strings
+        // 11. Categories must be an array of strings (not a bare string)
         const badCategories = await send('tools/call', {
             name: 'store_memory',
             arguments: { content: 'x', metadata: { categories: 'not-an-array' } }
         });
-        const badCategoriesText = badCategories.result?.content?.[0]?.text || '';
-        if (!badCategoriesText.includes('metadata.categories must be an array')) {
+        if (!isValidationError(badCategories, 'categories')) {
             failures.push('store_memory accepted non-array categories');
         }
 
@@ -227,9 +233,7 @@ async function runSmoke() {
         }
 
         // 13. LIKE wildcards in search query don't leak — searching for a unique
-        // marker with % should NOT match unrelated rows. We store two rows:
-        // one with '%', one without, then search for '100%' and check we only
-        // get the one with '100%'.
+        // marker with % should NOT match unrelated rows.
         await send('tools/call', {
             name: 'store_memory',
             arguments: { content: 'progress is 100% complete', metadata: { project: 'esc' } }
@@ -248,6 +252,46 @@ async function runSmoke() {
         }
         if (escText.includes('progress is ongoing')) {
             failures.push('search_memories for "100%" matched an entry without a % sign (escape broken)');
+        }
+
+        // 14. Phase 4: get_memory and delete_memory round-trip.
+        if (storedId !== null) {
+            const getResp = await send('tools/call', {
+                name: 'get_memory', arguments: { id: storedId }
+            });
+            const getText = getResp.result?.content?.[0]?.text || '';
+            if (!getText.includes(uniqueText)) {
+                failures.push(`get_memory did not return the stored canary for id=${storedId}`);
+            }
+            if (!getResp.result?.structuredContent?.found) {
+                failures.push('get_memory missing structuredContent.found=true');
+            }
+
+            const delResp = await send('tools/call', {
+                name: 'delete_memory', arguments: { id: storedId }
+            });
+            if (!delResp.result?.structuredContent?.deleted) {
+                failures.push('delete_memory structuredContent missing deleted=true');
+            }
+
+            // Searching for it again should now find nothing.
+            const aftergetResp = await send('tools/call', {
+                name: 'search_memories', arguments: { query: uniqueText }
+            });
+            const aftergetText = aftergetResp.result?.content?.[0]?.text || '';
+            if (aftergetText.includes(uniqueText)) {
+                failures.push('delete_memory did not actually delete the row');
+            }
+        }
+
+        // 15. Phase 4: structured content on store_memory includes id/project
+        const probeStore = await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'probe-' + Date.now(), metadata: { project: 'probe' } }
+        });
+        const sc = probeStore.result?.structuredContent;
+        if (!sc || typeof sc.id !== 'number' || sc.project !== 'probe') {
+            failures.push('store_memory missing structuredContent.id/project');
         }
 
     } catch (err) {

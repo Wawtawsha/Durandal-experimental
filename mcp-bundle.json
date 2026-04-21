@@ -23,6 +23,8 @@
       "store_memory",
       "search_memories",
       "get_context",
+      "get_memory",
+      "delete_memory",
       "optimize_memory",
       "get_status",
       "configure_logging",

@@ -46,7 +46,7 @@
   "author": "Enterprise Data and Analytics",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.5",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "sqlite3": "^5.1.6"
   },
   "engines": {

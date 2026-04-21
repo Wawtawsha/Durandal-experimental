@@ -312,7 +312,7 @@ class TestRunner {
         const DurandalMCPServer = require('./durandal-mcp-server-v3');
         const server = new DurandalMCPServer({ logLevel: 'error' });
 
-        // Wait for the async startup check to finish so it doesn't log after close.
+        // Wait for the async startup check so it doesn't log after close.
         await server.ready;
 
         const requiredTools = [
@@ -323,19 +323,17 @@ class TestRunner {
             'get_status',
             'configure_logging',
             'get_logs',
-            'list_projects_sessions'
+            'list_projects_sessions',
+            'get_memory',
+            'delete_memory'
         ];
 
-        const { ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
-        const handler = server.server._requestHandlers.get(ListToolsRequestSchema.shape.method.value);
-        if (!handler) {
-            throw new Error('ListTools handler not registered');
-        }
-        const result = await handler({ method: 'tools/list', params: {} }, {});
-        const toolNames = (result?.tools || []).map(t => t.name);
-
+        // In SDK 1.29 the high-level McpServer exposes registered tools on
+        // its _registeredTools dict. server.server on our wrapper refers to
+        // the McpServer instance (we named our wrapper's field 'server').
+        const registered = Object.keys(server.server._registeredTools || {});
         for (const tool of requiredTools) {
-            if (!toolNames.includes(tool)) {
+            if (!registered.includes(tool)) {
                 throw new Error(`Tool not registered: ${tool}`);
             }
         }

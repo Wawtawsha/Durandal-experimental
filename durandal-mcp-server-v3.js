@@ -67,37 +67,12 @@ class DurandalMCPServer extends EventEmitter {
             }
         });
 
-        // Initialize components
+        // Initialize components. The in-memory "RAMR cache" from prior versions
+        // was removed: it was a plain Map that duplicated DB state without
+        // invalidation, never actually prioritized by "cache priority", and was
+        // the root cause of the client-side-id-vs-DB-id dedup bug. SQLite with
+        // proper indexes is fast enough without it.
         this.db = new DatabaseAdapter();
-        this.cache = new Map();
-        this.accessPatterns = new Map();
-        this.initialized = false;
-
-        // Configuration
-        this.config = {
-            cache: {
-                maxSize: parseInt(process.env.CACHE_MAX_SIZE) || 1000,
-                defaultTTL: parseInt(process.env.CACHE_TTL) || 3600000,
-                importanceThreshold: parseFloat(process.env.CACHE_IMPORTANCE_THRESHOLD) || 0.5
-            },
-            ramr: {
-                enabled: process.env.RAMR_ENABLED !== 'false',
-                prefetchRelated: process.env.RAMR_PREFETCH !== 'false',
-                cacheScoreThreshold: parseFloat(process.env.RAMR_CACHE_THRESHOLD) || 0.7
-            },
-            selectiveAttention: {
-                enabled: process.env.SELECTIVE_ATTENTION_ENABLED !== 'false',
-                retentionThreshold: parseFloat(process.env.RETENTION_THRESHOLD) || 0.3,
-                archiveAfterDays: parseInt(process.env.ARCHIVE_AFTER_DAYS) || 30
-            }
-        };
-
-        // Log configuration
-        this.logger.logConfiguration({
-            cache: this.config.cache,
-            ramr: this.config.ramr,
-            selectiveAttention: this.config.selectiveAttention
-        });
 
         // Run database startup check — expose as a promise so tests/shutdown
         // can await completion instead of racing with fire-and-forget logging.
@@ -464,7 +439,7 @@ class DurandalMCPServer extends EventEmitter {
                     },
                     {
                         name: 'optimize_memory',
-                        description: 'Trigger automatic memory optimization',
+                        description: 'Run SQLite database maintenance (VACUUM, ANALYZE, integrity check, WAL checkpoint). Previously advertised "retention review" and "pattern analysis" operations which were placeholders; those were removed.',
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -472,9 +447,10 @@ class DurandalMCPServer extends EventEmitter {
                                     type: 'array',
                                     items: {
                                         type: 'string',
-                                        enum: ['cache_optimization', 'retention_review', 'pattern_analysis', 'relationship_update']
+                                        enum: ['vacuum', 'analyze', 'integrity_check', 'wal_checkpoint']
                                     },
-                                    default: ['cache_optimization']
+                                    default: ['vacuum', 'analyze'],
+                                    description: 'Maintenance operations to run, in order.'
                                 }
                             }
                         }
@@ -650,10 +626,6 @@ class DurandalMCPServer extends EventEmitter {
         }
         const memoryId = dbResult.id;
 
-        this.logger.substep('Caching under DB id');
-        this.storeInCache(memoryId, args.content, enrichedMetadata);
-        this.updateAccessPatterns(memoryId, 'store');
-
         this.logger.success(`Memory stored (id: ${memoryId})`, {
             requestId,
             memoryId,
@@ -682,63 +654,65 @@ class DurandalMCPServer extends EventEmitter {
         }
 
         const filters = args.filters || {};
-        const limit = Math.min(args.limit || 10, 100); // Cap at 100
+        const limit = Math.min(args.limit || 10, 100);
 
-        this.logger.substep('Checking cache');
-
-        // Search in cache first
-        const cacheResults = this.searchCache(args.query, filters);
+        // Validate importance range if supplied — caught a silent "filter ignored"
+        // bug where typos in filter keys produced no matches rather than errors.
+        if (filters.importance_min !== undefined && typeof filters.importance_min !== 'number') {
+            throw new ValidationError('importance_min must be a number', 'filters.importance_min', filters.importance_min);
+        }
+        if (filters.importance_max !== undefined && typeof filters.importance_max !== 'number') {
+            throw new ValidationError('importance_max must be a number', 'filters.importance_max', filters.importance_max);
+        }
 
         this.logger.substep('Querying database');
-
-        // Search in database
-        const dbResults = await this.searchDatabase(args.query, filters, limit).catch(error => {
-            this.logger.warn('Database search failed, using cache only', {
-                requestId,
-                error: error.message
-            });
-            return [];
+        const dbResults = await this.db.searchMemories(args.query, {
+            project: filters.project,
+            session: filters.session,
+            limit: limit * 2 // over-fetch so post-filters (categories/importance) can trim
         });
 
-        // Merge and deduplicate results
-        const allResults = this.mergeSearchResults(cacheResults, dbResults, limit);
+        // Post-filter by importance range and categories — these aren't columns,
+        // they live inside the metadata JSON, so we apply them in JS.
+        const filtered = dbResults.filter((r) => {
+            const m = r.metadata || {};
+            if (filters.importance_min !== undefined && (m.importance ?? 0) < filters.importance_min) return false;
+            if (filters.importance_max !== undefined && (m.importance ?? 0) > filters.importance_max) return false;
+            if (filters.categories && filters.categories.length) {
+                const cats = new Set(m.categories || []);
+                if (!filters.categories.some(c => cats.has(c))) return false;
+            }
+            return true;
+        }).slice(0, limit);
 
-        // Update access patterns for found memories
-        allResults.forEach(result => {
-            this.updateAccessPatterns(result.id, 'search');
-        });
-
-        this.logger.success(`Search completed (${allResults.length} results)`, {
+        this.logger.success(`Search completed (${filtered.length} results)`, {
             requestId,
             query: args.query,
-            resultsCount: allResults.length
+            resultsCount: filtered.length
         });
 
-        if (allResults.length === 0) {
+        if (filtered.length === 0) {
             return {
-                content: [{
-                    type: 'text',
-                    text: 'No memories found matching your query.'
-                }]
+                content: [{ type: 'text', text: 'No memories found matching your query.' }]
             };
         }
 
-        // Format results
-        const formattedResults = allResults.map((result, index) => {
-            const metadata = result.metadata || {};
-            return `**${index + 1}. Memory ${result.id}**\n` +
-                   `   Content: ${result.content.substring(0, 100)}${result.content.length > 100 ? '...' : ''}\n` +
-                   `   Project: ${metadata.project || 'None'}\n` +
-                   `   Session: ${metadata.session || 'None'}\n` +
-                   `   Importance: ${result.importance || metadata.importance || 'N/A'}\n` +
-                   `   Categories: ${result.categories?.join(', ') || metadata.categories?.join(', ') || 'None'}\n` +
-                   `   Created: ${result.created_at || 'Unknown'}`;
+        const formatted = filtered.map((r, i) => {
+            const m = r.metadata || {};
+            const preview = r.content.length > 100 ? r.content.slice(0, 100) + '...' : r.content;
+            return `**${i + 1}. Memory ${r.id}**\n` +
+                   `   Content: ${preview}\n` +
+                   `   Project: ${m.project || 'None'}\n` +
+                   `   Session: ${m.session || 'None'}\n` +
+                   `   Importance: ${m.importance ?? 'N/A'}\n` +
+                   `   Categories: ${m.categories?.join(', ') || 'None'}\n` +
+                   `   Created: ${r.created_at || 'Unknown'}`;
         }).join('\n\n');
 
         return {
             content: [{
                 type: 'text',
-                text: `**Search Results** (${allResults.length} found)\n\n${formattedResults}`
+                text: `**Search Results** (${filtered.length} found)\n\n${formatted}`
             }]
         };
     }
@@ -752,44 +726,37 @@ class DurandalMCPServer extends EventEmitter {
         const includeStats = args.include_stats !== false;
 
         this.logger.substep('Retrieving recent memories');
+        const recentMemories = await this.getRecentMemoriesFromDb(project, session, limit);
 
-        // Get recent memories from database
-        const recentMemories = await this.getRecentMemories(project, session, limit).catch(error => {
-            this.logger.warn('Failed to get recent memories from database', {
-                requestId,
-                error: error.message
-            });
-            return [];
-        });
-
-        // Get cached memories for this project/session
-        const cachedMemories = this.getCachedMemories(project, session);
-
-        // Compile statistics if requested
+        // Real stats — previously this reported made-up "RAMR enabled / Selective
+        // Attention enabled" flags plus a cache hit rate that measured nothing
+        // meaningful (every access pattern counted regardless of whether the
+        // memory was actually in cache).
         let stats = {};
         if (includeStats) {
+            const rowCountRes = await this.db.db.query('SELECT COUNT(*) as count FROM memories').catch(() => ({ rows: [{ count: 0 }] }));
+            const projectCountRes = project && project !== 'default'
+                ? await this.db.db.query("SELECT COUNT(*) as count FROM memories WHERE json_extract(metadata, '$.project') = ?", [project]).catch(() => ({ rows: [{ count: 0 }] }))
+                : null;
             stats = {
-                totalMemories: recentMemories.length + cachedMemories.length,
-                cacheSize: this.cache.size,
-                cacheHitRate: this.getCacheStats().hitRate,
-                ramrEnabled: this.config.ramr.enabled,
-                selectiveAttentionEnabled: this.config.selectiveAttention.enabled
+                totalMemoriesInDb: rowCountRes.rows[0]?.count || 0,
+                memoriesInProject: projectCountRes ? (projectCountRes.rows[0]?.count || 0) : null,
+                returned: recentMemories.length
             };
         }
 
         this.logger.success(`Context retrieved (${recentMemories.length} memories)`, {
             requestId,
-            memoriesCount: recentMemories.length,
-            cachedCount: cachedMemories.length
+            memoriesCount: recentMemories.length
         });
 
-        // Format response
         let response = `**Context for Project: ${project}, Session: ${session}**\n\n`;
 
         if (recentMemories.length > 0) {
             response += '**Recent Memories:**\n';
-            recentMemories.slice(0, 5).forEach((memory, index) => {
-                response += `${index + 1}. ${memory.content.substring(0, 80)}...\n`;
+            recentMemories.slice(0, Math.min(5, recentMemories.length)).forEach((memory, index) => {
+                const preview = memory.content.length > 80 ? memory.content.slice(0, 80) + '...' : memory.content;
+                response += `${index + 1}. ${preview}\n`;
             });
         } else {
             response += 'No recent memories found.\n';
@@ -797,74 +764,41 @@ class DurandalMCPServer extends EventEmitter {
 
         if (includeStats) {
             response += `\n**Statistics:**\n`;
-            response += `- Total Memories: ${stats.totalMemories}\n`;
-            response += `- Cache Size: ${stats.cacheSize}/${this.config.cache.maxSize}\n`;
-            response += `- Cache Hit Rate: ${stats.cacheHitRate.toFixed(1)}%\n`;
-            response += `- RAMR: ${stats.ramrEnabled ? 'Enabled' : 'Disabled'}\n`;
-            response += `- Selective Attention: ${stats.selectiveAttentionEnabled ? 'Enabled' : 'Disabled'}`;
+            response += `- Returned: ${stats.returned}\n`;
+            response += `- Total memories (database): ${stats.totalMemoriesInDb}\n`;
+            if (stats.memoriesInProject !== null) {
+                response += `- Memories in "${project}": ${stats.memoriesInProject}\n`;
+            }
         }
 
         return {
-            content: [{
-                type: 'text',
-                text: response
-            }]
+            content: [{ type: 'text', text: response }]
         };
     }
 
     async handleOptimizeMemory(args, requestId) {
         this.logger.processing('Processing optimize_memory request from Claude');
 
-        const operations = args.operations || ['cache_optimization'];
-
-        this.logger.substep(`Running ${operations.length} optimization operation(s)`);
+        const operations = args.operations || ['vacuum', 'analyze'];
+        this.logger.substep(`Running ${operations.length} maintenance operation(s)`);
 
         const results = [];
-
-        for (const operation of operations) {
+        for (const op of operations) {
             try {
-                switch (operation) {
-                    case 'cache_optimization':
-                        const cacheResult = this.optimizeCache();
-                        results.push(`[OK] Cache optimization: Evicted ${cacheResult.evicted} items`);
-                        break;
-
-                    case 'retention_review':
-                        const retentionResult = await this.reviewRetention();
-                        results.push(`[OK] Retention review: Archived ${retentionResult.archived} old memories`);
-                        break;
-
-                    case 'pattern_analysis':
-                        const patternResult = this.analyzePatterns();
-                        results.push(`[OK] Pattern analysis: Found ${patternResult.patterns} access patterns`);
-                        break;
-
-                    case 'relationship_update':
-                        results.push(`[OK] Relationship update: Feature in development`);
-                        break;
-
-                    default:
-                        results.push(`❓ Unknown operation: ${operation}`);
-                }
+                const message = await this.runMaintenanceOperation(op);
+                results.push(`[OK] ${op}: ${message}`);
             } catch (error) {
-                this.logger.error(`Optimization operation failed: ${operation}`, {
-                    requestId,
-                    error: error.message
-                });
-                results.push(`[ERR] ${operation} failed: ${error.message}`);
+                this.logger.error(`Maintenance operation failed: ${op}`, { requestId, error: error.message });
+                results.push(`[ERR] ${op} failed: ${error.message}`);
             }
         }
 
-        this.logger.success('Optimization complete', {
-            requestId,
-            operationsCount: operations.length,
-            successCount: results.length
-        });
+        this.logger.success('Maintenance complete', { requestId, operationsCount: operations.length });
 
         return {
             content: [{
                 type: 'text',
-                text: `[OK] **Memory Optimization Results:**\n\n${results.join('\n')}`
+                text: `**Database Maintenance Results:**\n\n${results.join('\n')}`
             }]
         };
     }
@@ -922,10 +856,6 @@ class DurandalMCPServer extends EventEmitter {
                 projectCount: dbProjectCount,
                 sessionCount: dbSessionCount
             },
-            cache: {
-                size: this.cache.size,
-                maxSize: this.config.cache.maxSize
-            },
             logging: {
                 consoleLevel: this.logger.getConsoleLevel(),
                 fileLevel: this.logger.getFileLevel(),
@@ -953,11 +883,10 @@ class DurandalMCPServer extends EventEmitter {
         output += `┃  Projects:        ${(statusData.database.projectCount + ' projects').padEnd(35)}┃\n`;
         output += `┃  Sessions:        ${(statusData.database.sessionCount + ' sessions').padEnd(35)}┃\n`;
         output += '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n';
-        output += `┃  Cache Memories:  ${(statusData.cache.size + ' / ' + statusData.cache.maxSize + ' cached').padEnd(35)}┃\n`;
-        output += '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n';
         output += `┃  Console Level:   ${statusData.logging.consoleLevel.padEnd(35)}┃\n`;
         output += `┃  File Level:      ${statusData.logging.fileLevel.padEnd(35)}┃\n`;
-        output += `┃  Log File:        ~/.durandal-mcp/logs/...              ┃\n`;
+        const logFileDisplay = (statusData.logging.logFile || '(none)').slice(-35).padStart(35);
+        output += `┃  Log File:        ${logFileDisplay}┃\n`;
         output += '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n';
         output += `┃  Node Version:    ${statusData.node.padEnd(35)}┃\n`;
         output += `┃  Platform:        ${statusData.platform.padEnd(35)}┃\n`;
@@ -1002,8 +931,8 @@ class DurandalMCPServer extends EventEmitter {
         let updated = [];
 
         if (console_level) {
-            if (envContent.includes('CONSOLE_LOG_LEVEL=')) {
-                envContent = envContent.replace(/CONSOLE_LOG_LEVEL=.*/g, `CONSOLE_LOG_LEVEL=${console_level}`);
+            if (/^CONSOLE_LOG_LEVEL=/m.test(envContent)) {
+                envContent = envContent.replace(/^CONSOLE_LOG_LEVEL=.*$/gm,`CONSOLE_LOG_LEVEL=${console_level}`);
             } else {
                 envContent += `\nCONSOLE_LOG_LEVEL=${console_level}\n`;
             }
@@ -1014,8 +943,8 @@ class DurandalMCPServer extends EventEmitter {
         }
 
         if (file_level) {
-            if (envContent.includes('FILE_LOG_LEVEL=')) {
-                envContent = envContent.replace(/FILE_LOG_LEVEL=.*/g, `FILE_LOG_LEVEL=${file_level}`);
+            if (/^FILE_LOG_LEVEL=/m.test(envContent)) {
+                envContent = envContent.replace(/^FILE_LOG_LEVEL=.*$/gm,`FILE_LOG_LEVEL=${file_level}`);
             } else {
                 envContent += `\nFILE_LOG_LEVEL=${file_level}\n`;
             }
@@ -1293,276 +1222,51 @@ class DurandalMCPServer extends EventEmitter {
         };
     }
 
-    // Helper methods
-    generateMemoryId() {
-        return Date.now().toString(36) + Math.random().toString(36).substring(2, 9);
-    }
+    // --- helpers -------------------------------------------------------
 
+    // Stamp a `created_at` on metadata. Prior versions layered "RAMR" and
+    // "selectiveAttention" objects onto every memory that were never read by
+    // anything meaningful — they've been removed.
     enrichMetadata(metadata) {
-        return {
-            ...metadata,
-            created_at: new Date().toISOString(),
-            ramr: {
-                cache_priority: this.calculateCachePriority(metadata),
-                prefetch_related: true,
-                access_pattern: {
-                    frequency: 0,
-                    last_access: null,
-                    access_times: []
-                }
-            },
-            selectiveAttention: {
-                retention_score: metadata.importance || 0.5,
-                review_date: this.calculateReviewDate(metadata)
+        return { ...metadata, created_at: new Date().toISOString() };
+    }
+
+    async getRecentMemoriesFromDb(project, session, limit) {
+        // Treat 'default' as "no filter" since the handler supplies it as a
+        // fallback — otherwise users who never passed a project see nothing.
+        const p = project && project !== 'default' ? project : null;
+        const s = session && session !== 'default' ? session : null;
+        return await this.db.getRecentMemories(limit, p, s);
+    }
+
+    // Real database maintenance. Replaces the placeholder "cache_optimization",
+    // "retention_review", "pattern_analysis", "relationship_update" operations
+    // that returned static numbers or "Feature in development" text.
+    async runMaintenanceOperation(op) {
+        const client = this.db.db.client;
+        switch (op) {
+            case 'vacuum':
+                await new Promise((res, rej) => client.exec('VACUUM', e => e ? rej(e) : res()));
+                return 'VACUUM completed (reclaimed fragmentation)';
+            case 'analyze':
+                await new Promise((res, rej) => client.exec('ANALYZE', e => e ? rej(e) : res()));
+                return 'ANALYZE completed (query planner statistics refreshed)';
+            case 'integrity_check': {
+                const rows = await new Promise((res, rej) =>
+                    client.all('PRAGMA integrity_check', (e, r) => e ? rej(e) : res(r))
+                );
+                const ok = rows.length === 1 && rows[0].integrity_check === 'ok';
+                return ok ? 'integrity_check: ok' : `integrity_check: ${rows.map(r => r.integrity_check).join('; ')}`;
             }
-        };
-    }
-
-    calculateCachePriority(metadata) {
-        const importance = metadata.importance || 0.5;
-        const hasCategories = (metadata.categories?.length || 0) > 0;
-        const hasKeywords = (metadata.keywords?.length || 0) > 0;
-
-        let priority = importance * 0.6;
-        if (hasCategories) priority += 0.2;
-        if (hasKeywords) priority += 0.2;
-
-        return Math.min(priority, 1.0);
-    }
-
-    calculateReviewDate(metadata) {
-        const importance = metadata.importance || 0.5;
-        const daysUntilReview = Math.floor(30 * (1 + importance));
-        const reviewDate = new Date();
-        reviewDate.setDate(reviewDate.getDate() + daysUntilReview);
-        return reviewDate.toISOString();
-    }
-
-    storeInCache(id, content, metadata) {
-        if (this.cache.size >= this.config.cache.maxSize) {
-            this.evictFromCache();
-        }
-
-        this.cache.set(id, {
-            content,
-            metadata,
-            timestamp: Date.now()
-        });
-    }
-
-    evictFromCache() {
-        // Simple LRU eviction
-        let oldestKey = null;
-        let oldestTime = Infinity;
-
-        for (const [key, value] of this.cache) {
-            if (value.timestamp < oldestTime) {
-                oldestTime = value.timestamp;
-                oldestKey = key;
+            case 'wal_checkpoint': {
+                const row = await new Promise((res, rej) =>
+                    client.get('PRAGMA wal_checkpoint(TRUNCATE)', (e, r) => e ? rej(e) : res(r))
+                );
+                return `wal_checkpoint: ${JSON.stringify(row)}`;
             }
+            default:
+                throw new ValidationError(`Unknown maintenance operation: ${op}`, 'operation', op);
         }
-
-        if (oldestKey) {
-            this.cache.delete(oldestKey);
-            this.logger.debug('Evicted from cache', { id: oldestKey });
-        }
-    }
-
-    async storeInDatabase(memoryId, content, metadata) {
-        try {
-            // Store directly in memories table with project/session in metadata
-            await this.db.storeMemory(content, metadata);
-
-            this.logger.debug('Stored in database', {
-                memoryId,
-                project: metadata.project || 'default',
-                session: metadata.session || 'current'
-            });
-        } catch (error) {
-            throw new DatabaseError('Failed to store memory in database', 'store', error);
-        }
-    }
-
-    // Note: Project and session are now stored in memory metadata
-    // The old project/session tables are not used for MCP memories
-
-    async getRecentMemories(project, session, limit) {
-        try {
-            let query = `
-                SELECT id, content, metadata, created_at
-                FROM memories
-                WHERE 1=1
-            `;
-            const params = [];
-
-            // Add project filter
-            if (project && project !== 'default') {
-                query += ` AND json_extract(metadata, '$.project') = ?`;
-                params.push(project);
-            }
-
-            // Add session filter
-            if (session && session !== 'default') {
-                query += ` AND json_extract(metadata, '$.session') = ?`;
-                params.push(session);
-            }
-
-            query += ` ORDER BY created_at DESC LIMIT ?`;
-            params.push(limit);
-
-            const result = await this.db.db.query(query, params);
-
-            return result.rows.map(row => ({
-                id: row.id,
-                content: row.content,
-                metadata: row.metadata ? JSON.parse(row.metadata) : {},
-                timestamp: row.created_at
-            }));
-        } catch (error) {
-            this.logger.error('Failed to get recent memories', { error: error.message });
-            return [];
-        }
-    }
-
-    searchCache(query, filters) {
-        const results = [];
-        const queryLower = query.toLowerCase();
-
-        for (const [id, memory] of this.cache) {
-            if (memory.content.toLowerCase().includes(queryLower)) {
-                // Apply filters
-                if (filters.project && memory.metadata.project !== filters.project) continue;
-                if (filters.session && memory.metadata.session !== filters.session) continue;
-                if (filters.importance_min && memory.metadata.importance < filters.importance_min) continue;
-                if (filters.importance_max && memory.metadata.importance > filters.importance_max) continue;
-
-                results.push({
-                    id,
-                    content: memory.content,
-                    ...memory.metadata
-                });
-            }
-        }
-
-        return results;
-    }
-
-    async searchDatabase(query, filters, limit) {
-        try {
-            return await this.db.searchMemories(query, {
-                project: filters.project,
-                session: filters.session,
-                limit
-            });
-        } catch (error) {
-            throw new DatabaseError('Failed to search database', 'search', error);
-        }
-    }
-
-    mergeSearchResults(cacheResults, dbResults, limit) {
-        const seen = new Set();
-        const merged = [];
-
-        // Add cache results first (more recent)
-        for (const result of cacheResults) {
-            if (merged.length >= limit) break;
-            seen.add(result.id);
-            merged.push(result);
-        }
-
-        // Add database results
-        for (const result of dbResults) {
-            if (merged.length >= limit) break;
-            if (!seen.has(result.id)) {
-                merged.push(result);
-            }
-        }
-
-        return merged;
-    }
-
-    getCachedMemories(project, session) {
-        const memories = [];
-
-        for (const [id, memory] of this.cache) {
-            if (memory.metadata.project === project && memory.metadata.session === session) {
-                memories.push({
-                    id,
-                    content: memory.content,
-                    ...memory.metadata
-                });
-            }
-        }
-
-        return memories;
-    }
-
-    optimizeCache() {
-        let evicted = 0;
-        const now = Date.now();
-
-        for (const [id, memory] of this.cache) {
-            // Evict based on importance and age
-            const age = now - memory.timestamp;
-            const importance = memory.metadata.importance || 0.5;
-
-            if (age > this.config.cache.defaultTTL && importance < this.config.cache.importanceThreshold) {
-                this.cache.delete(id);
-                evicted++;
-            }
-        }
-
-        return { evicted };
-    }
-
-    async reviewRetention() {
-        // This would implement selective attention logic
-        // For now, just a placeholder
-        return { archived: 0 };
-    }
-
-    analyzePatterns() {
-        // Analyze access patterns for RAMR
-        let patterns = 0;
-
-        for (const [id, accesses] of this.accessPatterns) {
-            if (accesses.length > 3) {
-                patterns++;
-            }
-        }
-
-        return { patterns };
-    }
-
-    updateAccessPatterns(memoryId, action) {
-        if (!this.accessPatterns.has(memoryId)) {
-            this.accessPatterns.set(memoryId, []);
-        }
-
-        this.accessPatterns.get(memoryId).push({
-            action,
-            timestamp: Date.now()
-        });
-
-        // Limit pattern history
-        const patterns = this.accessPatterns.get(memoryId);
-        if (patterns.length > 100) {
-            patterns.shift();
-        }
-    }
-
-    getCacheStats() {
-        const hits = Array.from(this.accessPatterns.values())
-            .reduce((sum, patterns) => sum + patterns.filter(p => p.action === 'search').length, 0);
-
-        const total = Array.from(this.accessPatterns.values())
-            .reduce((sum, patterns) => sum + patterns.length, 0);
-
-        return {
-            size: this.cache.size,
-            hitRate: total > 0 ? (hits / total) * 100 : 0,
-            maxSize: this.config.cache.maxSize
-        };
     }
 
     async start() {
@@ -1969,15 +1673,15 @@ async function configureLogLevel() {
     }
 
     // Update or add console level
-    if (envContent.includes('CONSOLE_LOG_LEVEL=')) {
-        envContent = envContent.replace(/CONSOLE_LOG_LEVEL=.*/g, `CONSOLE_LOG_LEVEL=${consoleLevel}`);
+    if (/^CONSOLE_LOG_LEVEL=/m.test(envContent)) {
+        envContent = envContent.replace(/^CONSOLE_LOG_LEVEL=.*$/gm,`CONSOLE_LOG_LEVEL=${consoleLevel}`);
     } else {
         envContent += `\nCONSOLE_LOG_LEVEL=${consoleLevel}\n`;
     }
 
     // Update or add file level
-    if (envContent.includes('FILE_LOG_LEVEL=')) {
-        envContent = envContent.replace(/FILE_LOG_LEVEL=.*/g, `FILE_LOG_LEVEL=${fileLevel}`);
+    if (/^FILE_LOG_LEVEL=/m.test(envContent)) {
+        envContent = envContent.replace(/^FILE_LOG_LEVEL=.*$/gm,`FILE_LOG_LEVEL=${fileLevel}`);
     } else {
         envContent += `FILE_LOG_LEVEL=${fileLevel}\n`;
     }

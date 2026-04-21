@@ -4,6 +4,10 @@
  * Comprehensive test suite for validating MCP server functionality
  */
 
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
 const DatabaseAdapter = require('./db-adapter');
 const MCPDatabaseClient = require('./mcp-db-client');
 const Logger = require('./logger');
@@ -16,6 +20,17 @@ class TestRunner {
         this.passed = 0;
         this.failed = 0;
         this.startTime = Date.now();
+
+        // Test isolation: point every test at a fresh, disposable SQLite file.
+        // Previously `npm test` ran against whatever DB the resolution logic
+        // picked — typically the user's real ~/.durandal-mcp database —
+        // adding 100+ junk rows from the performance test on each run.
+        if (!process.env.DURANDAL_TEST_KEEP_DB) {
+            this._tempDbPath = path.join(os.tmpdir(), `durandal-test-${Date.now()}-${process.pid}.db`);
+            process.env.DATABASE_PATH = this._tempDbPath;
+            // Disable update checks during tests
+            process.env.NO_UPDATE_CHECK = '1';
+        }
     }
 
     /**
@@ -48,6 +63,18 @@ class TestRunner {
 
         // Print summary
         this.printSummary();
+
+        // Clean up the temp database we created for isolation.
+        if (this._tempDbPath) {
+            try {
+                fs.unlinkSync(this._tempDbPath);
+                // SQLite may have left WAL/SHM siblings
+                for (const ext of ['-wal', '-shm', '-journal']) {
+                    const sibling = this._tempDbPath + ext;
+                    if (fs.existsSync(sibling)) fs.unlinkSync(sibling);
+                }
+            } catch (_) { /* best-effort cleanup */ }
+        }
 
         return this.failed === 0;
     }

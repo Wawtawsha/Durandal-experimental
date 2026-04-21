@@ -150,6 +150,47 @@ async function runSmoke() {
         const statusText = statusResp.result?.content?.[0]?.text || '';
         if (!statusText.includes('Durandal MCP Server')) failures.push('get_status output missing server banner');
 
+        // 6. get_context returns the memory we just stored
+        const ctxResp = await send('tools/call', {
+            name: 'get_context',
+            arguments: { project: 'smoke', session: 'smoke-run', limit: 5 }
+        });
+        if (ctxResp.error) failures.push(`get_context error: ${JSON.stringify(ctxResp.error)}`);
+        const ctxText = ctxResp.result?.content?.[0]?.text || '';
+        if (!ctxText.includes(uniqueText)) failures.push('get_context did not include the stored canary');
+
+        // 7. optimize_memory runs real DB ops (vacuum/analyze) and reports them
+        const optResp = await send('tools/call', {
+            name: 'optimize_memory',
+            arguments: { operations: ['vacuum', 'analyze', 'integrity_check'] }
+        });
+        if (optResp.error) failures.push(`optimize_memory error: ${JSON.stringify(optResp.error)}`);
+        const optText = optResp.result?.content?.[0]?.text || '';
+        for (const expected of ['VACUUM completed', 'ANALYZE completed', 'integrity_check: ok']) {
+            if (!optText.includes(expected)) failures.push(`optimize_memory missing "${expected}": ${optText.slice(0, 300)}`);
+        }
+
+        // 8. Importance filter works (search with a min-importance that excludes our 0.7 entry)
+        const filteredResp = await send('tools/call', {
+            name: 'search_memories',
+            arguments: { query: uniqueText, filters: { importance_min: 0.9 } }
+        });
+        if (filteredResp.error) failures.push(`filtered search error: ${JSON.stringify(filteredResp.error)}`);
+        const filteredText = filteredResp.result?.content?.[0]?.text || '';
+        if (filteredText.includes(uniqueText)) {
+            failures.push('search_memories importance_min=0.9 returned a 0.7-importance memory (filter not applied)');
+        }
+
+        // 9. Invalid importance_min should return a validation error in response text
+        const badFilterResp = await send('tools/call', {
+            name: 'search_memories',
+            arguments: { query: 'anything', filters: { importance_min: 'not-a-number' } }
+        });
+        const badFilterText = badFilterResp.result?.content?.[0]?.text || '';
+        if (!badFilterText.includes('importance_min must be a number')) {
+            failures.push('search_memories did not reject non-numeric importance_min');
+        }
+
     } catch (err) {
         failures.push(`Exception: ${err.message}`);
     } finally {

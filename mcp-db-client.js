@@ -120,30 +120,70 @@ class MCPDatabaseClient {
     }
 
     async initializeSQLiteSchema() {
-        const schema = `
+        // Core table + indexes. FTS5 is added separately so we can fall back
+        // if the sqlite3 build happens to be compiled without FTS5 support.
+        const core = `
             CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 content TEXT NOT NULL,
                 metadata TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-
             CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
             CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(json_extract(metadata, '$.project')) WHERE json_extract(metadata, '$.project') IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(json_extract(metadata, '$.session')) WHERE json_extract(metadata, '$.session') IS NOT NULL;
         `;
+        await new Promise((res, rej) => this.client.exec(core, e => e ? rej(e) : res()));
 
-        return new Promise((resolve, reject) => {
-            this.client.exec(schema, (err) => {
-                if (err) {
-                    process.stderr.write(`[DB] Schema init failed: ${err.message}\n`);
-                    return reject(err);
-                }
-                this.initialized = true;
-                process.stderr.write('[DB] Schema initialized\n');
-                resolve();
-            });
-        });
+        // FTS5 virtual table with external-content linkage, plus triggers to
+        // keep it in sync. After this, search can do BM25-ranked full-text
+        // instead of LIKE substring. If the sqlite3 build lacks FTS5 for some
+        // reason, we log and fall back to LIKE-only search — no crash.
+        try {
+            const fts = `
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    content,
+                    content='memories',
+                    content_rowid='id',
+                    tokenize='porter unicode61'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.id, old.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.id, old.content);
+                    INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+                END;
+            `;
+            await new Promise((res, rej) => this.client.exec(fts, e => e ? rej(e) : res()));
+
+            // Backfill: if memories has rows but memories_fts is empty (fresh
+            // FTS table on a legacy DB), rebuild the FTS index from the
+            // existing content column.
+            const ftsCount = await new Promise((res, rej) =>
+                this.client.get('SELECT COUNT(*) as c FROM memories_fts', (e, r) => e ? rej(e) : res(r?.c || 0))
+            ).catch(() => 0);
+            const memCount = await new Promise((res, rej) =>
+                this.client.get('SELECT COUNT(*) as c FROM memories', (e, r) => e ? rej(e) : res(r?.c || 0))
+            ).catch(() => 0);
+            if (memCount > 0 && ftsCount === 0) {
+                process.stderr.write(`[DB] Backfilling FTS index for ${memCount} existing memories...\n`);
+                await new Promise((res, rej) =>
+                    this.client.exec("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", e => e ? rej(e) : res())
+                );
+            }
+            this.ftsAvailable = true;
+        } catch (e) {
+            process.stderr.write(`[DB] FTS5 unavailable, falling back to LIKE search: ${e.message}\n`);
+            this.ftsAvailable = false;
+        }
+
+        this.initialized = true;
+        process.stderr.write('[DB] Schema initialized\n');
     }
 
     async testConnection() {
@@ -232,24 +272,62 @@ class MCPDatabaseClient {
         return { id: row.id, content: row.content, metadata, created_at: row.created_at };
     }
 
+    // Sanitize a user-typed search query for FTS5 MATCH syntax. We SPLIT on
+    // any non-word-character run (not just whitespace) so a hyphenated query
+    // like "smoke-test-marker" becomes five tokens, matching the way the
+    // FTS5 unicode61 tokenizer already breaks the stored content.
+    _toFtsQuery(input) {
+        const tokens = String(input)
+            .split(/[^\p{L}\p{N}_]+/u)
+            .filter(Boolean);
+        if (!tokens.length) return null;
+        return tokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' ');
+    }
+
     async searchMemories(query, options = {}, limitArg) {
         try {
             await this.ready;
-            // Accept limit from options OR positional 3rd arg (keeps db-adapter signature working).
             const limit = limitArg ?? options.limit ?? 10;
             const { project, session } = options;
 
+            // Try FTS5 first for proper tokenized, BM25-ranked search. This
+            // correctly handles "react typescript" as AND-of-tokens and ranks
+            // by relevance instead of just recency.
+            if (this.ftsAvailable) {
+                const ftsQuery = this._toFtsQuery(query);
+                if (ftsQuery) {
+                    let sql = `
+                        SELECT m.id, m.content, m.metadata, m.created_at, bm25(memories_fts) AS rank
+                        FROM memories_fts
+                        JOIN memories m ON memories_fts.rowid = m.id
+                        WHERE memories_fts MATCH ?
+                    `;
+                    const params = [ftsQuery];
+                    if (project) { sql += " AND json_extract(m.metadata, '$.project') = ?"; params.push(project); }
+                    if (session) { sql += " AND json_extract(m.metadata, '$.session') = ?"; params.push(session); }
+                    sql += ' ORDER BY rank LIMIT ?';
+                    params.push(limit);
+
+                    try {
+                        const result = await this.query(sql, params);
+                        return result.rows.map((row) => {
+                            const parsed = this._parseRow(row);
+                            parsed.relevance = row.rank;
+                            return parsed;
+                        });
+                    } catch (e) {
+                        // Malformed MATCH — fall through to LIKE
+                        process.stderr.write(`[DB] FTS match failed, falling back to LIKE: ${e.message}\n`);
+                    }
+                }
+            }
+
+            // LIKE fallback: used when FTS isn't available OR when the query
+            // tokenizes to nothing (e.g. pure punctuation) OR when MATCH failed.
             let sql = "SELECT id, content, metadata, created_at FROM memories WHERE content LIKE ? ESCAPE '\\'";
             const params = [`%${this._escapeLike(query)}%`];
-
-            if (project) {
-                sql += " AND json_extract(metadata, '$.project') = ?";
-                params.push(project);
-            }
-            if (session) {
-                sql += " AND json_extract(metadata, '$.session') = ?";
-                params.push(session);
-            }
+            if (project) { sql += " AND json_extract(metadata, '$.project') = ?"; params.push(project); }
+            if (session) { sql += " AND json_extract(metadata, '$.session') = ?"; params.push(session); }
             sql += ' ORDER BY created_at DESC LIMIT ?';
             params.push(limit);
 

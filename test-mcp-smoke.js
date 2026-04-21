@@ -294,6 +294,47 @@ async function runSmoke() {
             failures.push('store_memory missing structuredContent.id/project');
         }
 
+        // 16. Phase 5: FTS tokenized search. Store two rows where one contains
+        // both "react" and "typescript" and the other contains only "typescript".
+        // Searching for "react typescript" should return only the first row.
+        const ftsProject = 'fts-' + Date.now();
+        await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'I like React with TypeScript for web apps', metadata: { project: ftsProject } }
+        });
+        await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'TypeScript on the backend is also nice', metadata: { project: ftsProject } }
+        });
+        const ftsResp = await send('tools/call', {
+            name: 'search_memories',
+            arguments: { query: 'react typescript', filters: { project: ftsProject } }
+        });
+        const ftsText = ftsResp.result?.content?.[0]?.text || '';
+        if (!ftsText.includes('React with TypeScript')) {
+            failures.push('FTS search did not return the react+typescript row');
+        }
+        if (ftsText.includes('backend is also nice')) {
+            failures.push('FTS search for "react typescript" incorrectly returned backend-only row (tokenized AND not enforced)');
+        }
+
+        // 17. Phase 5: FTS results carry a relevance score in structuredContent
+        const ftsStruct = ftsResp.result?.structuredContent;
+        const firstResult = ftsStruct?.results?.[0];
+        if (firstResult && typeof firstResult.relevance !== 'number') {
+            failures.push('FTS search result missing relevance score in structuredContent');
+        }
+
+        // 18. Phase 5: optimize_memory reports before/after size deltas
+        const sizeOpt = await send('tools/call', {
+            name: 'optimize_memory',
+            arguments: { operations: ['vacuum'] }
+        });
+        const optSc = sizeOpt.result?.structuredContent;
+        if (!optSc || typeof optSc.sizeBefore !== 'number' || typeof optSc.sizeAfter !== 'number') {
+            failures.push('optimize_memory structuredContent missing sizeBefore/sizeAfter');
+        }
+
     } catch (err) {
         failures.push(`Exception: ${err.message}`);
     } finally {

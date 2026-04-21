@@ -273,9 +273,9 @@ class DurandalMCPServer extends EventEmitter {
 
         R('search_memories', {
             title: 'Search Memories',
-            description: 'Search stored memories by content substring. Results can be filtered by project/session/categories/importance range.',
+            description: 'Full-text search over stored memories with BM25 relevance ranking. The query is tokenized on whitespace and all tokens must match (implicit AND). Results can be filtered by project/session/categories/importance range. Falls back to substring search if the query tokenizes to nothing.',
             inputSchema: {
-                query: z.string().min(1).describe('Substring to search within memory content'),
+                query: z.string().min(1).describe('Search query. Tokens are AND-ed; "react typescript" matches rows with both words.'),
                 filters: filtersSchema.optional(),
                 limit: z.number().int().min(1).max(100).optional().default(10)
             },
@@ -456,6 +456,11 @@ class DurandalMCPServer extends EventEmitter {
             return { content: [{ type: 'text', text: 'No memories found matching your query.' }] };
         }
 
+        // Results come back ranked by FTS BM25 when possible, so position i=0
+        // is the best match. We don't print raw BM25 scores — they're negative
+        // and un-normalized, so the number is meaningless to humans. The
+        // structuredContent.results below still carries the raw relevance
+        // for programmatic consumers.
         const formatted = filtered.map((r, i) => {
             const m = r.metadata || {};
             const preview = r.content.length > 100 ? r.content.slice(0, 100) + '...' : r.content;
@@ -476,7 +481,8 @@ class DurandalMCPServer extends EventEmitter {
                     id: r.id,
                     content: r.content,
                     metadata: r.metadata,
-                    created_at: r.created_at
+                    created_at: r.created_at,
+                    relevance: r.relevance ?? null
                 }))
             }
         };
@@ -539,6 +545,12 @@ class DurandalMCPServer extends EventEmitter {
         this.logger.processing('Processing optimize_memory request from Claude');
         const operations = args.operations || ['vacuum', 'analyze'];
 
+        // Capture before/after DB size so the user can see what VACUUM actually
+        // reclaimed. Prior versions printed "Cache optimization: Evicted 0 items"
+        // with no connection to disk footprint.
+        const dbPath = this.db.db.dbPath;
+        const sizeBefore = fs.existsSync(dbPath) ? fs.statSync(dbPath).size : 0;
+
         const results = [];
         for (const op of operations) {
             try {
@@ -550,15 +562,22 @@ class DurandalMCPServer extends EventEmitter {
             }
         }
 
-        this.logger.success('Maintenance complete', { requestId, operationsCount: operations.length });
+        const sizeAfter = fs.existsSync(dbPath) ? fs.statSync(dbPath).size : 0;
+        const delta = sizeAfter - sizeBefore;
+        const kb = (b) => (b / 1024).toFixed(1);
+
+        this.logger.success('Maintenance complete', {
+            requestId, operationsCount: operations.length, sizeBefore, sizeAfter
+        });
 
         const text = results.map(r =>
             `${r.status === 'ok' ? '[OK]' : '[ERR]'} ${r.operation}: ${r.message}`
         ).join('\n');
+        const sizeLine = `\n\nDatabase size: ${kb(sizeBefore)} KB → ${kb(sizeAfter)} KB (${delta >= 0 ? '+' : ''}${kb(delta)} KB)`;
 
         return {
-            content: [{ type: 'text', text: `**Database Maintenance Results:**\n\n${text}` }],
-            structuredContent: { results }
+            content: [{ type: 'text', text: `**Database Maintenance Results:**\n\n${text}${sizeLine}` }],
+            structuredContent: { results, sizeBefore, sizeAfter, sizeDelta: delta }
         };
     }
 

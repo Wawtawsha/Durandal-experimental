@@ -325,7 +325,13 @@ class TestRunner {
             'get_logs',
             'list_projects_sessions',
             'get_memory',
-            'delete_memory'
+            'delete_memory',
+            'store_memories_batch',
+            'update_memory',
+            'list_memories',
+            'export_memories',
+            'import_memories',
+            'rename_project'
         ];
 
         // In SDK 1.29 the high-level McpServer exposes registered tools on

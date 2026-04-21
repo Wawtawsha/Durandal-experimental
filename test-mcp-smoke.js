@@ -335,6 +335,107 @@ async function runSmoke() {
             failures.push('optimize_memory structuredContent missing sizeBefore/sizeAfter');
         }
 
+        // 19. Phase 6: bulk insert via store_memories_batch
+        const batchResp = await send('tools/call', {
+            name: 'store_memories_batch',
+            arguments: {
+                items: [
+                    { content: 'batch-item-1', metadata: { project: 'batch' } },
+                    { content: 'batch-item-2', metadata: { project: 'batch' } },
+                    { content: 'batch-item-3', metadata: { project: 'batch' } }
+                ]
+            }
+        });
+        const batchSc = batchResp.result?.structuredContent;
+        if (!batchSc || batchSc.count !== 3 || !Array.isArray(batchSc.ids) || batchSc.ids.length !== 3) {
+            failures.push('store_memories_batch did not return 3 ids');
+        }
+        const batchId = batchSc?.ids?.[0];
+
+        // 20. Phase 6: update_memory modifies content
+        if (typeof batchId === 'number') {
+            const updResp = await send('tools/call', {
+                name: 'update_memory',
+                arguments: { id: batchId, content: 'batch-item-1 (updated)' }
+            });
+            if (!updResp.result?.structuredContent?.updated) {
+                failures.push('update_memory did not report updated=true');
+            }
+            const getUpdated = await send('tools/call', {
+                name: 'get_memory',
+                arguments: { id: batchId }
+            });
+            if (!getUpdated.result?.content?.[0]?.text?.includes('(updated)')) {
+                failures.push('update_memory did not persist the new content');
+            }
+        }
+
+        // 21. Phase 6: list_memories pagination + project filter
+        const listMemResp = await send('tools/call', {
+            name: 'list_memories',
+            arguments: { project: 'batch', limit: 10 }
+        });
+        const listSc = listMemResp.result?.structuredContent;
+        if (!listSc || listSc.count < 3) {
+            failures.push(`list_memories for project=batch returned ${listSc?.count} rows, expected >= 3`);
+        }
+
+        // 22. Phase 6: rename_project moves all batch rows under "renamed-batch"
+        const renameResp = await send('tools/call', {
+            name: 'rename_project',
+            arguments: { from: 'batch', to: 'renamed-batch' }
+        });
+        if (!renameResp.result?.structuredContent?.renamed) {
+            failures.push('rename_project did not rename any rows');
+        }
+        const listAfter = await send('tools/call', {
+            name: 'list_memories',
+            arguments: { project: 'renamed-batch', limit: 10 }
+        });
+        if ((listAfter.result?.structuredContent?.count || 0) < 3) {
+            failures.push('list_memories did not find renamed rows under new project name');
+        }
+
+        // 23. Phase 6: export_memories returns structured payload with count + memories
+        const exportResp = await send('tools/call', {
+            name: 'export_memories',
+            arguments: {}
+        });
+        const exp = exportResp.result?.structuredContent;
+        if (!exp || typeof exp.count !== 'number' || !Array.isArray(exp.memories)) {
+            failures.push('export_memories did not return { count, memories }');
+        }
+
+        // 24. Phase 6: MCP resources — list + read one
+        const resListResp = await send('resources/list');
+        const resources = resListResp.result?.resources || [];
+        if (!resources.length) {
+            failures.push('resources/list returned empty array (expected memory resources)');
+        }
+        const sampleUri = resources[0]?.uri;
+        if (sampleUri) {
+            const readResp = await send('resources/read', { uri: sampleUri });
+            const contents = readResp.result?.contents;
+            if (!contents?.[0]?.text || !contents[0].text.includes('"id"')) {
+                failures.push(`resources/read on ${sampleUri} did not return JSON memory body`);
+            }
+        }
+
+        // 25. Phase 6: MCP prompts — list + get
+        const promptListResp = await send('prompts/list');
+        const promptNames = (promptListResp.result?.prompts || []).map(p => p.name);
+        if (!promptNames.includes('summarize_recent_memories')) {
+            failures.push('prompts/list did not include summarize_recent_memories');
+        }
+        const promptGetResp = await send('prompts/get', {
+            name: 'summarize_recent_memories',
+            arguments: { project: 'renamed-batch', limit: '5' }
+        });
+        const promptText = promptGetResp.result?.messages?.[0]?.content?.text || '';
+        if (!promptText.includes('summarize')) {
+            failures.push('summarize_recent_memories prompt did not produce expected body');
+        }
+
     } catch (err) {
         failures.push(`Exception: ${err.message}`);
     } finally {

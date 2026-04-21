@@ -92,6 +92,9 @@ class DurandalMCPServer extends EventEmitter {
         }, {
             capabilities: {
                 tools: { listChanged: true },
+                // Phase 6: announce resources (memory://{id}) and prompt templates
+                resources: { listChanged: true },
+                prompts: { listChanged: true },
                 logging: {}
             }
         });
@@ -357,6 +360,151 @@ class DurandalMCPServer extends EventEmitter {
             inputSchema: { id: z.number().int().positive() },
             annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }
         }, this.handleDeleteMemory);
+
+        // --- Phase 6 additions ---
+
+        R('store_memories_batch', {
+            title: 'Store Memories (Batch)',
+            description: 'Insert multiple memories in a single transaction. Returns the list of created ids in input order.',
+            inputSchema: {
+                items: z.array(z.object({
+                    content: z.string().min(1).max(50000),
+                    metadata: metadataSchema.optional()
+                })).min(1).max(1000)
+            },
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+        }, this.handleStoreMemoriesBatch);
+
+        R('update_memory', {
+            title: 'Update Memory',
+            description: 'Update content and/or metadata of an existing memory. Provided metadata replaces the existing metadata entirely.',
+            inputSchema: {
+                id: z.number().int().positive(),
+                content: z.string().min(1).max(50000).optional(),
+                metadata: metadataSchema.optional()
+            },
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+        }, this.handleUpdateMemory);
+
+        R('list_memories', {
+            title: 'List Memories',
+            description: 'Paginated list of memories with optional project/session/date filters. No search query required.',
+            inputSchema: {
+                project: z.string().optional(),
+                session: z.string().optional(),
+                since: z.string().optional().describe('ISO 8601 start timestamp (inclusive)'),
+                until: z.string().optional().describe('ISO 8601 end timestamp (inclusive)'),
+                limit: z.number().int().min(1).max(500).optional().default(50),
+                offset: z.number().int().min(0).optional().default(0)
+            },
+            annotations: { readOnlyHint: true, openWorldHint: false }
+        }, this.handleListMemories);
+
+        R('export_memories', {
+            title: 'Export Memories',
+            description: 'Dump all memories as a JSON array suitable for backup or migration.',
+            inputSchema: {},
+            annotations: { readOnlyHint: true, openWorldHint: false }
+        }, this.handleExportMemories);
+
+        R('import_memories', {
+            title: 'Import Memories',
+            description: 'Insert memories from a JSON array (as produced by export_memories). Each item may provide content and metadata.',
+            inputSchema: {
+                items: z.array(z.object({
+                    content: z.string().min(1),
+                    // Use an open object with passthrough instead of z.record —
+                    // Zod 4's record-to-JSON-schema conversion crashes on
+                    // records of z.any(), but an open object serializes fine.
+                    metadata: z.object({}).passthrough().optional()
+                })).min(1).max(10000)
+            },
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+        }, this.handleImportMemories);
+
+        R('rename_project', {
+            title: 'Rename Project',
+            description: 'Rename a project name across every memory that has it. Useful for reorganizing.',
+            inputSchema: {
+                from: z.string().min(1),
+                to: z.string().min(1)
+            },
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+        }, this.handleRenameProject);
+
+        // --- MCP resources: each memory is addressable as durandal://memory/{id} ---
+        // Using a ResourceTemplate so clients can list and discover memories
+        // without the server pre-enumerating them all.
+        const { ResourceTemplate } = require('@modelcontextprotocol/sdk/server/mcp.js');
+        this.server.registerResource(
+            'memory',
+            new ResourceTemplate('durandal://memory/{id}', {
+                list: async () => {
+                    const recent = await this.db.getRecentMemories(100, null, null);
+                    return {
+                        resources: recent.map(r => ({
+                            uri: `durandal://memory/${r.id}`,
+                            name: `Memory ${r.id}`,
+                            description: r.content.slice(0, 120),
+                            mimeType: 'application/json'
+                        }))
+                    };
+                }
+            }),
+            {
+                title: 'Memory',
+                description: 'An individual stored memory, addressable by its numeric id.',
+                mimeType: 'application/json'
+            },
+            async (uri, params) => {
+                const id = Number(params.id);
+                if (!Number.isInteger(id) || id <= 0) {
+                    throw new ValidationError(`Invalid memory id: ${params.id}`, 'id', params.id);
+                }
+                const memory = await this.db.getMemoryById(id);
+                if (!memory) {
+                    throw new MCPError(`Memory ${id} not found`, 'NOT_FOUND');
+                }
+                return {
+                    contents: [{
+                        uri: uri.href,
+                        mimeType: 'application/json',
+                        text: JSON.stringify(memory, null, 2)
+                    }]
+                };
+            }
+        );
+
+        // --- MCP prompt template: canned "summarize recent memories" prompt ---
+        this.server.registerPrompt(
+            'summarize_recent_memories',
+            {
+                title: 'Summarize Recent Memories',
+                description: 'Produce a prompt that asks Claude to summarize the recent memories for a given project.',
+                argsSchema: {
+                    project: z.string().optional(),
+                    limit: z.string().optional()
+                }
+            },
+            async (args) => {
+                const project = args.project || 'default';
+                const limit = Math.min(parseInt(args.limit || '20', 10) || 20, 100);
+                const p = project !== 'default' ? project : null;
+                const memories = await this.db.getRecentMemories(limit, p, null);
+                const body = memories.length
+                    ? memories.map(m => `- (id ${m.id}, ${m.created_at}) ${m.content}`).join('\n')
+                    : '(no memories in scope)';
+                return {
+                    messages: [{
+                        role: 'user',
+                        content: {
+                            type: 'text',
+                            text: `Please summarize the following ${memories.length} recent memories from project "${project}". Identify themes, outstanding questions, and anything worth flagging for next session.\n\n${body}`
+                        }
+                    }]
+                };
+            }
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -956,6 +1104,161 @@ class DurandalMCPServer extends EventEmitter {
         return {
             content: [{ type: 'text', text: `[OK] Deleted memory ${args.id}.` }],
             structuredContent: { deleted: true, id: args.id, changes: res.changes }
+        };
+    }
+
+    async handleStoreMemoriesBatch(args, requestId) {
+        this.logger.processing('Processing store_memories_batch request');
+        const prepared = args.items.map(it => {
+            const meta = { ...(it.metadata || {}) };
+            if (!meta.project) meta.project = 'default';
+            if (!meta.session) meta.session = new Date().toISOString().split('T')[0];
+            meta.created_at = new Date().toISOString();
+            // Same 64KB metadata cap as store_memory. Reject the whole batch
+            // on oversize to keep behavior consistent with the single variant.
+            const serialized = JSON.stringify(meta);
+            if (serialized.length > 65536) {
+                throw new ValidationError(
+                    `metadata for batch item exceeds maximum size (${serialized.length} bytes)`,
+                    'metadata', serialized.length
+                );
+            }
+            return { content: it.content, metadata: meta };
+        });
+
+        const res = await this.db.storeMemoriesBatch(prepared);
+        if (!res.success) {
+            throw new DatabaseError('Batch insert failed', 'batch_store', new Error(res.error));
+        }
+        this.logger.success(`Stored ${res.ids.length} memories`, { requestId, count: res.ids.length });
+        return {
+            content: [{
+                type: 'text',
+                text: `[OK] Stored ${res.ids.length} memories.\nIDs: ${res.ids.join(', ')}`
+            }],
+            structuredContent: { count: res.ids.length, ids: res.ids }
+        };
+    }
+
+    async handleUpdateMemory(args, requestId) {
+        this.logger.processing('Processing update_memory request');
+        if (args.content === undefined && args.metadata === undefined) {
+            throw new ValidationError(
+                'update_memory requires at least one of `content` or `metadata`',
+                'args', args
+            );
+        }
+        const patch = {};
+        if (args.content !== undefined) patch.content = args.content;
+        if (args.metadata !== undefined) patch.metadata = { ...args.metadata };
+
+        if (patch.metadata) {
+            const serialized = JSON.stringify(patch.metadata);
+            if (serialized.length > 65536) {
+                throw new ValidationError(
+                    `metadata exceeds maximum size (${serialized.length} bytes)`,
+                    'metadata', serialized.length
+                );
+            }
+        }
+
+        const res = await this.db.updateMemory(args.id, patch);
+        if (!res.success) {
+            if (res.error === 'not_found') {
+                return {
+                    content: [{ type: 'text', text: `Memory ${args.id} not found.` }],
+                    structuredContent: { updated: false, id: args.id }
+                };
+            }
+            throw new DatabaseError('Failed to update memory', 'update', new Error(res.error));
+        }
+        return {
+            content: [{ type: 'text', text: `[OK] Updated memory ${args.id}.` }],
+            structuredContent: { updated: true, id: args.id }
+        };
+    }
+
+    async handleListMemories(args, requestId) {
+        this.logger.processing('Processing list_memories request');
+        const memories = await this.db.listMemories({
+            project: args.project,
+            session: args.session,
+            since: args.since,
+            until: args.until,
+            limit: args.limit ?? 50,
+            offset: args.offset ?? 0
+        });
+        this.logger.success(`Listed ${memories.length} memories`, { requestId });
+        const preview = memories.slice(0, 20).map((m, i) => {
+            const c = m.content.length > 80 ? m.content.slice(0, 80) + '...' : m.content;
+            return `${i + 1}. [${m.id}] ${c}`;
+        }).join('\n');
+        return {
+            content: [{
+                type: 'text',
+                text: `**Memories** (${memories.length} shown${args.offset ? `, starting at offset ${args.offset}` : ''})\n\n${preview || '(none)'}`
+            }],
+            structuredContent: {
+                count: memories.length,
+                offset: args.offset ?? 0,
+                limit: args.limit ?? 50,
+                memories
+            }
+        };
+    }
+
+    async handleExportMemories(args, requestId) {
+        this.logger.processing('Processing export_memories request');
+        const memories = await this.db.exportAll();
+        const payload = {
+            version: this.packageInfo.version,
+            exported_at: new Date().toISOString(),
+            count: memories.length,
+            memories
+        };
+        return {
+            content: [{
+                type: 'text',
+                text: `**Exported ${memories.length} memories.**\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``
+            }],
+            structuredContent: payload
+        };
+    }
+
+    async handleImportMemories(args, requestId) {
+        this.logger.processing('Processing import_memories request');
+        const items = args.items.map(it => ({
+            content: it.content,
+            metadata: it.metadata || {}
+        }));
+        const res = await this.db.storeMemoriesBatch(items);
+        if (!res.success) {
+            throw new DatabaseError('Import failed', 'import', new Error(res.error));
+        }
+        return {
+            content: [{ type: 'text', text: `[OK] Imported ${res.ids.length} memories.` }],
+            structuredContent: { count: res.ids.length, ids: res.ids }
+        };
+    }
+
+    async handleRenameProject(args, requestId) {
+        this.logger.processing('Processing rename_project request');
+        if (args.from === args.to) {
+            return {
+                content: [{ type: 'text', text: `Source and destination project names are identical; nothing to do.` }],
+                structuredContent: { renamed: 0 }
+            };
+        }
+        const res = await this.db.renameProject(args.from, args.to);
+        if (!res.success) {
+            throw new DatabaseError('rename_project failed', 'rename', new Error(res.error));
+        }
+        return {
+            content: [{
+                type: 'text',
+                text: `[OK] Renamed ${res.changes} memories from project "${args.from}" to "${args.to}".`
+            }],
+            structuredContent: { renamed: res.changes, from: args.from, to: args.to }
         };
     }
 

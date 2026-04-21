@@ -390,6 +390,116 @@ class MCPDatabaseClient {
             return { success: false, error: error.message };
         }
     }
+
+    // Phase 6: bulk insert wrapped in a single transaction. Without this,
+    // 100-row imports fire 100 sqlite commits which is ~100x slower.
+    async storeMemoriesBatch(items) {
+        try {
+            await this.ready;
+            await new Promise((res, rej) => this.client.exec('BEGIN', e => e ? rej(e) : res()));
+            const stmt = this.client.prepare('INSERT INTO memories (content, metadata) VALUES (?, ?)');
+            const ids = [];
+            try {
+                for (const { content, metadata } of items) {
+                    const id = await new Promise((res, rej) => {
+                        stmt.run(content, JSON.stringify(metadata || {}), function (err) {
+                            if (err) return rej(err);
+                            res(this.lastID);
+                        });
+                    });
+                    ids.push(id);
+                }
+                await new Promise((res) => stmt.finalize(() => res()));
+                await new Promise((res, rej) => this.client.exec('COMMIT', e => e ? rej(e) : res()));
+                return { success: true, ids };
+            } catch (e) {
+                await new Promise((res) => stmt.finalize(() => res()));
+                await new Promise((res) => this.client.exec('ROLLBACK', () => res()));
+                throw e;
+            }
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
+    }
+
+    // Phase 6: update content and/or metadata of an existing row.
+    async updateMemory(id, { content, metadata }) {
+        try {
+            await this.ready;
+            const existing = await this.getMemoryById(id);
+            if (!existing) return { success: false, error: 'not_found' };
+            const nextContent = content !== undefined ? content : existing.content;
+            const nextMetadata = metadata !== undefined ? metadata : existing.metadata;
+            await this.query(
+                'UPDATE memories SET content = ?, metadata = ? WHERE id = ?',
+                [nextContent, JSON.stringify(nextMetadata || {}), id]
+            );
+            return { success: true };
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
+    }
+
+    // Phase 6: paginated list with filters. Distinct from search_memories
+    // (no query required) and get_context (no project/session defaulting).
+    async listMemories({ project, session, offset = 0, limit = 50, since, until }) {
+        try {
+            await this.ready;
+            let sql = 'SELECT id, content, metadata, created_at FROM memories';
+            const conditions = [];
+            const params = [];
+            if (project) { conditions.push("json_extract(metadata, '$.project') = ?"); params.push(project); }
+            if (session) { conditions.push("json_extract(metadata, '$.session') = ?"); params.push(session); }
+            if (since) { conditions.push('created_at >= ?'); params.push(since); }
+            if (until) { conditions.push('created_at <= ?'); params.push(until); }
+            if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+            sql += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+            params.push(limit, offset);
+            const result = await this.query(sql, params);
+            return result.rows.map((row) => this._parseRow(row));
+        } catch (error) {
+            process.stderr.write(`[DB] listMemories error: ${error.message}\n`);
+            return [];
+        }
+    }
+
+    // Phase 6: return all rows for export. Stream-friendly in principle,
+    // but for typical DB sizes (<1M rows) a single query is fine.
+    async exportAll() {
+        try {
+            await this.ready;
+            const result = await this.query('SELECT id, content, metadata, created_at FROM memories ORDER BY id');
+            return result.rows.map((row) => this._parseRow(row));
+        } catch (error) {
+            process.stderr.write(`[DB] exportAll error: ${error.message}\n`);
+            return [];
+        }
+    }
+
+    // Phase 6: rename a project across all memories' metadata JSON.
+    // Uses SQLite's json_set so we don't have to read every row into JS.
+    async renameProject(fromName, toName) {
+        try {
+            await this.ready;
+            const result = await this.query(
+                "UPDATE memories SET metadata = json_set(metadata, '$.project', ?) WHERE json_extract(metadata, '$.project') = ?",
+                [toName, fromName]
+            );
+            return { success: true, changes: result.rowCount || 0 };
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
+    }
+
+    async countAll() {
+        try {
+            await this.ready;
+            const r = await this.query('SELECT COUNT(*) as c FROM memories');
+            return r.rows[0]?.c || 0;
+        } catch (_) {
+            return 0;
+        }
+    }
 }
 
 module.exports = MCPDatabaseClient;

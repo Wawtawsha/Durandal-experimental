@@ -37,6 +37,30 @@ class DatabaseAdapter {
         return await this.db.deleteMemoryById(id);
     }
 
+    async storeMemoriesBatch(items) {
+        return await this.db.storeMemoriesBatch(items);
+    }
+
+    async updateMemory(id, patch) {
+        return await this.db.updateMemory(id, patch);
+    }
+
+    async listMemories(filters) {
+        return await this.db.listMemories(filters);
+    }
+
+    async exportAll() {
+        return await this.db.exportAll();
+    }
+
+    async renameProject(from, to) {
+        return await this.db.renameProject(from, to);
+    }
+
+    async countAll() {
+        return await this.db.countAll();
+    }
+
     async close() {
         if (this.db?.close) await this.db.close();
     }

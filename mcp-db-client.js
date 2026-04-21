@@ -292,12 +292,16 @@ class MCPDatabaseClient {
 
             // Try FTS5 first for proper tokenized, BM25-ranked search. This
             // correctly handles "react typescript" as AND-of-tokens and ranks
-            // by relevance instead of just recency.
+            // by relevance instead of just recency. snippet() extracts a
+            // 16-token window around the match, wrapping matched tokens with
+            // ** ... ** so clients can highlight them.
             if (this.ftsAvailable) {
                 const ftsQuery = this._toFtsQuery(query);
                 if (ftsQuery) {
                     let sql = `
-                        SELECT m.id, m.content, m.metadata, m.created_at, bm25(memories_fts) AS rank
+                        SELECT m.id, m.content, m.metadata, m.created_at,
+                               bm25(memories_fts) AS rank,
+                               snippet(memories_fts, 0, '**', '**', '…', 16) AS snippet
                         FROM memories_fts
                         JOIN memories m ON memories_fts.rowid = m.id
                         WHERE memories_fts MATCH ?
@@ -313,6 +317,7 @@ class MCPDatabaseClient {
                         return result.rows.map((row) => {
                             const parsed = this._parseRow(row);
                             parsed.relevance = row.rank;
+                            parsed.snippet = row.snippet;
                             return parsed;
                         });
                     } catch (e) {
@@ -498,6 +503,52 @@ class MCPDatabaseClient {
             return r.rows[0]?.c || 0;
         } catch (_) {
             return 0;
+        }
+    }
+
+    // Iteration 2: atomic backup using SQLite's VACUUM INTO. Writes a
+    // consistent snapshot to destPath even while other transactions are
+    // running, without needing to close the live database.
+    async backupTo(destPath) {
+        try {
+            await this.ready;
+            // VACUUM INTO requires a literal path — can't be parameterized.
+            // We sanitize by requiring it to be an absolute path with no
+            // single quotes (since sqlite strings are '...').
+            if (typeof destPath !== 'string' || destPath.includes("'")) {
+                throw new Error('Invalid destination path');
+            }
+            const escaped = destPath.replace(/'/g, "''");
+            await new Promise((res, rej) =>
+                this.client.exec(`VACUUM INTO '${escaped}'`, e => e ? rej(e) : res())
+            );
+            return { success: true, path: destPath };
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
+    }
+
+    // Iteration 2: bulk delete by filter. Returns number of rows deleted.
+    // Same filter shape as listMemories.
+    async deleteMemoriesWhere({ project, session, olderThan }) {
+        try {
+            await this.ready;
+            if (!project && !session && !olderThan) {
+                // Safety: never allow unfiltered bulk deletes. The user must
+                // specify at least one criterion.
+                return { success: false, error: 'at_least_one_filter_required' };
+            }
+            let sql = 'DELETE FROM memories';
+            const conditions = [];
+            const params = [];
+            if (project) { conditions.push("json_extract(metadata, '$.project') = ?"); params.push(project); }
+            if (session) { conditions.push("json_extract(metadata, '$.session') = ?"); params.push(session); }
+            if (olderThan) { conditions.push('created_at < ?'); params.push(olderThan); }
+            sql += ' WHERE ' + conditions.join(' AND ');
+            const result = await this.query(sql, params);
+            return { success: true, deleted: result.rowCount || 0 };
+        } catch (error) {
+            return { success: false, error: error.message };
         }
     }
 }

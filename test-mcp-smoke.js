@@ -130,18 +130,21 @@ async function runSmoke() {
         if (!idMatch) failures.push(`store_memory response missing numeric ID: ${storeText.slice(0, 200)}`);
         const storedId = idMatch ? Number(idMatch[1]) : null;
 
-        // 4. search_memories finds it
+        // 4. search_memories finds it. We check structuredContent.results for
+        // the raw content (FTS snippet() wraps matched tokens with **...**,
+        // so the display text no longer contains the unhyphenated marker).
         const searchResp = await send('tools/call', {
             name: 'search_memories',
             arguments: { query: uniqueText, limit: 5 }
         });
         if (searchResp.error) failures.push(`search_memories error: ${JSON.stringify(searchResp.error)}`);
-        const searchText = searchResp.result?.content?.[0]?.text || '';
-        if (!searchText.includes(uniqueText)) {
+        const searchResults = searchResp.result?.structuredContent?.results || [];
+        const foundCanary = searchResults.find(r => r.content.includes(uniqueText));
+        if (!foundCanary) {
             failures.push('search_memories did not find the stored canary phrase');
         }
-        if (storedId !== null && !searchText.includes(`Memory ${storedId}`)) {
-            failures.push(`search_memories did not return the stored id (${storedId})`);
+        if (storedId !== null && foundCanary && foundCanary.id !== storedId) {
+            failures.push(`search_memories returned wrong id: got ${foundCanary.id}, expected ${storedId}`);
         }
 
         // 5. get_status returns counts
@@ -246,12 +249,12 @@ async function runSmoke() {
             name: 'search_memories',
             arguments: { query: '100%', filters: { project: 'esc' } }
         });
-        const escText = escResp.result?.content?.[0]?.text || '';
-        if (!escText.includes('100% complete')) {
+        const escResults = escResp.result?.structuredContent?.results || [];
+        if (!escResults.some(r => r.content.includes('100% complete'))) {
             failures.push('search_memories did not return the "100% complete" entry');
         }
-        if (escText.includes('progress is ongoing')) {
-            failures.push('search_memories for "100%" matched an entry without a % sign (escape broken)');
+        if (escResults.some(r => r.content.includes('progress is ongoing'))) {
+            failures.push('search_memories for "100%" matched an entry without a "%" in content');
         }
 
         // 14. Phase 4: get_memory and delete_memory round-trip.
@@ -310,19 +313,21 @@ async function runSmoke() {
             name: 'search_memories',
             arguments: { query: 'react typescript', filters: { project: ftsProject } }
         });
-        const ftsText = ftsResp.result?.content?.[0]?.text || '';
-        if (!ftsText.includes('React with TypeScript')) {
+        const ftsResults = ftsResp.result?.structuredContent?.results || [];
+        if (!ftsResults.some(r => r.content.includes('React with TypeScript'))) {
             failures.push('FTS search did not return the react+typescript row');
         }
-        if (ftsText.includes('backend is also nice')) {
+        if (ftsResults.some(r => r.content.includes('backend is also nice'))) {
             failures.push('FTS search for "react typescript" incorrectly returned backend-only row (tokenized AND not enforced)');
         }
 
-        // 17. Phase 5: FTS results carry a relevance score in structuredContent
-        const ftsStruct = ftsResp.result?.structuredContent;
-        const firstResult = ftsStruct?.results?.[0];
+        // 17. Phase 5: FTS results carry a relevance score and a snippet.
+        const firstResult = ftsResults[0];
         if (firstResult && typeof firstResult.relevance !== 'number') {
             failures.push('FTS search result missing relevance score in structuredContent');
+        }
+        if (firstResult && (!firstResult.snippet || !firstResult.snippet.includes('**'))) {
+            failures.push('FTS search result missing ** markup in snippet');
         }
 
         // 18. Phase 5: optimize_memory reports before/after size deltas
@@ -434,6 +439,52 @@ async function runSmoke() {
         const promptText = promptGetResp.result?.messages?.[0]?.content?.text || '';
         if (!promptText.includes('summarize')) {
             failures.push('summarize_recent_memories prompt did not produce expected body');
+        }
+
+        // 26. Iteration 2: backup_database produces a valid SQLite snapshot
+        const backupPath = path.join(require('os').tmpdir(), `durandal-smoke-backup-${Date.now()}.db`);
+        const backupResp = await send('tools/call', {
+            name: 'backup_database',
+            arguments: { destination: backupPath }
+        });
+        if (!backupResp.result?.structuredContent?.path) {
+            failures.push('backup_database did not return a path in structuredContent');
+        }
+        if (!fs.existsSync(backupPath) || fs.statSync(backupPath).size < 100) {
+            failures.push('backup_database claimed success but file is missing or too small');
+        } else {
+            fs.unlinkSync(backupPath);
+        }
+
+        // 27. Iteration 2: delete_memories_where requires a filter and actually deletes
+        const noFilter = await send('tools/call', {
+            name: 'delete_memories_where', arguments: {}
+        });
+        if (noFilter.result?.isError !== true) {
+            failures.push('delete_memories_where without filters should be rejected');
+        }
+        const delProject = 'cleanup-' + Date.now();
+        await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'disposable', metadata: { project: delProject } }
+        });
+        await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'also disposable', metadata: { project: delProject } }
+        });
+        const delResp = await send('tools/call', {
+            name: 'delete_memories_where',
+            arguments: { project: delProject }
+        });
+        if ((delResp.result?.structuredContent?.deleted || 0) < 2) {
+            failures.push(`delete_memories_where deleted ${delResp.result?.structuredContent?.deleted}; expected >= 2`);
+        }
+
+        // 28. Iteration 2: get_status reports FTS availability
+        const ftsStatus = await send('tools/call', { name: 'get_status', arguments: {} });
+        const ftsStatusSc = ftsStatus.result?.structuredContent;
+        if (ftsStatusSc?.database?.ftsEnabled !== true) {
+            failures.push('get_status did not report ftsEnabled=true');
         }
 
     } catch (err) {

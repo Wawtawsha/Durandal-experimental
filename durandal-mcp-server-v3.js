@@ -432,6 +432,28 @@ class DurandalMCPServer extends EventEmitter {
             annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
         }, this.handleRenameProject);
 
+        // --- Iteration 2 additions ---
+
+        R('backup_database', {
+            title: 'Backup Database',
+            description: 'Create an atomic, consistent snapshot of the memory database at the given path. Uses SQLite VACUUM INTO — no downtime, no locked writes.',
+            inputSchema: {
+                destination: z.string().min(1).describe('Absolute path where the backup file will be written')
+            },
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
+        }, this.handleBackupDatabase);
+
+        R('delete_memories_where', {
+            title: 'Delete Memories By Filter',
+            description: 'Bulk delete memories matching a project, session, or older-than timestamp filter. Requires at least one filter criterion. Irreversible.',
+            inputSchema: {
+                project: z.string().optional(),
+                session: z.string().optional(),
+                older_than: z.string().optional().describe('ISO 8601 timestamp; rows with created_at < this are deleted')
+            },
+            annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }
+        }, this.handleDeleteMemoriesWhere);
+
         // --- MCP resources: each memory is addressable as durandal://memory/{id} ---
         // Using a ResourceTemplate so clients can list and discover memories
         // without the server pre-enumerating them all.
@@ -508,36 +530,43 @@ class DurandalMCPServer extends EventEmitter {
     }
 
     // -------------------------------------------------------------------------
+    // Tool handler helpers (DRY for metadata defaults + size check)
+    // -------------------------------------------------------------------------
+
+    // Stamp a `created_at`, default project/session, and enforce the 64 KB
+    // serialized-metadata cap. Used by store_memory, store_memories_batch,
+    // update_memory. Extracted so the three call sites can't drift.
+    prepareStoredMetadata(metadata, fieldLabel = 'metadata') {
+        const m = { ...(metadata || {}) };
+        if (!m.project) m.project = 'default';
+        if (!m.session) m.session = new Date().toISOString().split('T')[0];
+        m.created_at = new Date().toISOString();
+
+        let serialized;
+        try {
+            serialized = JSON.stringify(m);
+        } catch (e) {
+            throw new ValidationError(`${fieldLabel} is not serializable: ${e.message}`, fieldLabel, null);
+        }
+        if (serialized.length > 65536) {
+            throw new ValidationError(
+                `${fieldLabel} exceeds maximum size (${serialized.length} bytes, max 65536)`,
+                fieldLabel,
+                serialized.length
+            );
+        }
+        return m;
+    }
+
+    // -------------------------------------------------------------------------
     // Tool handlers
     // -------------------------------------------------------------------------
 
     async handleStoreMemory(args, requestId) {
         this.logger.processing('Processing store_memory request from Claude');
 
-        // Zod enforces types on `content` and metadata shape, but not
-        // serialized-metadata size or the circular-reference guard — those
-        // are structural concerns outside the schema layer.
         const content = args.content;
-        const metadata = args.metadata || {};
-
-        if (!metadata.project) metadata.project = 'default';
-        if (!metadata.session) metadata.session = new Date().toISOString().split('T')[0];
-
-        const enriched = { ...metadata, created_at: new Date().toISOString() };
-
-        let serialized;
-        try {
-            serialized = JSON.stringify(enriched);
-        } catch (e) {
-            throw new ValidationError(`metadata is not serializable: ${e.message}`, 'metadata', null);
-        }
-        if (serialized.length > 65536) {
-            throw new ValidationError(
-                `metadata exceeds maximum size (${serialized.length} bytes, max 65536)`,
-                'metadata',
-                serialized.length
-            );
-        }
+        const enriched = this.prepareStoredMetadata(args.metadata);
 
         this.logger.substep('Storing to database');
         const dbResult = await this.db.storeMemory(content, enriched);
@@ -606,14 +635,17 @@ class DurandalMCPServer extends EventEmitter {
 
         // Results come back ranked by FTS BM25 when possible, so position i=0
         // is the best match. We don't print raw BM25 scores — they're negative
-        // and un-normalized, so the number is meaningless to humans. The
-        // structuredContent.results below still carries the raw relevance
-        // for programmatic consumers.
+        // and un-normalized, so the number is meaningless to humans. When FTS
+        // fired we use its snippet() output (16-token window around the match
+        // with matched tokens wrapped in ** ** for client highlighting);
+        // otherwise we fall back to a simple content prefix.
         const formatted = filtered.map((r, i) => {
             const m = r.metadata || {};
-            const preview = r.content.length > 100 ? r.content.slice(0, 100) + '...' : r.content;
+            const body = r.snippet
+                ? r.snippet
+                : (r.content.length > 100 ? r.content.slice(0, 100) + '...' : r.content);
             return `**${i + 1}. Memory ${r.id}**\n` +
-                   `   Content: ${preview}\n` +
+                   `   ${body}\n` +
                    `   Project: ${m.project || 'None'}\n` +
                    `   Session: ${m.session || 'None'}\n` +
                    `   Importance: ${m.importance ?? 'N/A'}\n` +
@@ -630,7 +662,8 @@ class DurandalMCPServer extends EventEmitter {
                     content: r.content,
                     metadata: r.metadata,
                     created_at: r.created_at,
-                    relevance: r.relevance ?? null
+                    relevance: r.relevance ?? null,
+                    snippet: r.snippet ?? null
                 }))
             }
         };
@@ -793,7 +826,8 @@ class DurandalMCPServer extends EventEmitter {
                 size: dbSize,
                 memoryCount: dbMemoryCount,
                 projectCount: dbProjectCount,
-                sessionCount: dbSessionCount
+                sessionCount: dbSessionCount,
+                ftsEnabled: this.db.db.ftsAvailable === true
             },
             logging: {
                 consoleLevel: this.logger.getConsoleLevel(),
@@ -1109,22 +1143,10 @@ class DurandalMCPServer extends EventEmitter {
 
     async handleStoreMemoriesBatch(args, requestId) {
         this.logger.processing('Processing store_memories_batch request');
-        const prepared = args.items.map(it => {
-            const meta = { ...(it.metadata || {}) };
-            if (!meta.project) meta.project = 'default';
-            if (!meta.session) meta.session = new Date().toISOString().split('T')[0];
-            meta.created_at = new Date().toISOString();
-            // Same 64KB metadata cap as store_memory. Reject the whole batch
-            // on oversize to keep behavior consistent with the single variant.
-            const serialized = JSON.stringify(meta);
-            if (serialized.length > 65536) {
-                throw new ValidationError(
-                    `metadata for batch item exceeds maximum size (${serialized.length} bytes)`,
-                    'metadata', serialized.length
-                );
-            }
-            return { content: it.content, metadata: meta };
-        });
+        const prepared = args.items.map((it, i) => ({
+            content: it.content,
+            metadata: this.prepareStoredMetadata(it.metadata, `items[${i}].metadata`)
+        }));
 
         const res = await this.db.storeMemoriesBatch(prepared);
         if (!res.success) {
@@ -1150,16 +1172,22 @@ class DurandalMCPServer extends EventEmitter {
         }
         const patch = {};
         if (args.content !== undefined) patch.content = args.content;
-        if (args.metadata !== undefined) patch.metadata = { ...args.metadata };
-
-        if (patch.metadata) {
-            const serialized = JSON.stringify(patch.metadata);
+        if (args.metadata !== undefined) {
+            // Intentionally DON'T stamp created_at on updates — preserve the
+            // original creation time. The serialize-size cap still applies.
+            let serialized;
+            try {
+                serialized = JSON.stringify(args.metadata);
+            } catch (e) {
+                throw new ValidationError(`metadata is not serializable: ${e.message}`, 'metadata', null);
+            }
             if (serialized.length > 65536) {
                 throw new ValidationError(
-                    `metadata exceeds maximum size (${serialized.length} bytes)`,
+                    `metadata exceeds maximum size (${serialized.length} bytes, max 65536)`,
                     'metadata', serialized.length
                 );
             }
+            patch.metadata = { ...args.metadata };
         }
 
         const res = await this.db.updateMemory(args.id, patch);
@@ -1259,6 +1287,48 @@ class DurandalMCPServer extends EventEmitter {
                 text: `[OK] Renamed ${res.changes} memories from project "${args.from}" to "${args.to}".`
             }],
             structuredContent: { renamed: res.changes, from: args.from, to: args.to }
+        };
+    }
+
+    async handleBackupDatabase(args, requestId) {
+        this.logger.processing('Processing backup_database request');
+        const absPath = path.resolve(args.destination);
+        const res = await this.db.backupTo(absPath);
+        if (!res.success) {
+            throw new DatabaseError('backup failed', 'backup', new Error(res.error));
+        }
+        const size = fs.existsSync(absPath) ? fs.statSync(absPath).size : 0;
+        return {
+            content: [{
+                type: 'text',
+                text: `[OK] Backup written to ${absPath}\nSize: ${(size / 1024).toFixed(1)} KB`
+            }],
+            structuredContent: { path: absPath, size }
+        };
+    }
+
+    async handleDeleteMemoriesWhere(args, requestId) {
+        this.logger.processing('Processing delete_memories_where request');
+        const res = await this.db.deleteMemoriesWhere({
+            project: args.project,
+            session: args.session,
+            olderThan: args.older_than
+        });
+        if (!res.success) {
+            if (res.error === 'at_least_one_filter_required') {
+                throw new ValidationError(
+                    'delete_memories_where requires at least one of project, session, older_than',
+                    'args', args
+                );
+            }
+            throw new DatabaseError('delete_memories_where failed', 'bulk_delete', new Error(res.error));
+        }
+        return {
+            content: [{
+                type: 'text',
+                text: `[OK] Deleted ${res.deleted} memories matching filter.`
+            }],
+            structuredContent: { deleted: res.deleted, filter: { project: args.project, session: args.session, older_than: args.older_than } }
         };
     }
 

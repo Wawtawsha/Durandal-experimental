@@ -61,6 +61,14 @@ class DatabaseAdapter {
         return await this.db.countAll();
     }
 
+    async backupTo(destPath) {
+        return await this.db.backupTo(destPath);
+    }
+
+    async deleteMemoriesWhere(filters) {
+        return await this.db.deleteMemoriesWhere(filters);
+    }
+
     async close() {
         if (this.db?.close) await this.db.close();
     }

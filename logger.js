@@ -210,34 +210,37 @@ class Logger {
         const shouldDisplayConsole = level === 'fatal' || levelValue >= this.consoleLevel;
         const shouldLogToFile = levelValue >= this.fileLevel;
 
-        // Console output
+        // Console output — ALWAYS goes to stderr. stdout is reserved for the
+        // MCP stdio transport's JSON-RPC messages; mixing logs into stdout
+        // corrupts the wire protocol. Previously info/warn/debug went to stdout.
         if (shouldDisplayConsole) {
             const formattedMessage = this.formatMessage(level, message, meta, emoji);
-            if (level === 'error' || level === 'fatal') {
-                console.error(formattedMessage);
-            } else {
-                console.log(formattedMessage);
-            }
+            process.stderr.write(formattedMessage + '\n');
         }
 
-        // File output - always log to file if level is appropriate
-        if (this.logStream && shouldLogToFile) {
-            this.logStream.write(JSON.stringify({
-                timestamp: new Date().toISOString(),
-                level,
-                message,
-                ...meta
-            }) + '\n');
+        // File output - always log to file if level is appropriate.
+        // Guard against writes after end — runDatabaseStartupCheck is fire-and-forget
+        // in the server constructor, so it can finish after close() during tests.
+        if (this.logStream && !this._closed && shouldLogToFile) {
+            try {
+                this.logStream.write(JSON.stringify({
+                    timestamp: new Date().toISOString(),
+                    level,
+                    message,
+                    ...meta
+                }) + '\n');
+            } catch (_) { /* stream closed — ignore */ }
         }
 
-        // Error file output
-        if (this.errorStream && (level === 'error' || level === 'fatal')) {
-            this.errorStream.write(JSON.stringify({
-                timestamp: new Date().toISOString(),
-                level,
-                message,
-                ...meta
-            }) + '\n');
+        if (this.errorStream && !this._closed && (level === 'error' || level === 'fatal')) {
+            try {
+                this.errorStream.write(JSON.stringify({
+                    timestamp: new Date().toISOString(),
+                    level,
+                    message,
+                    ...meta
+                }) + '\n');
+            } catch (_) { /* stream closed — ignore */ }
         }
     }
 
@@ -266,7 +269,7 @@ class Logger {
 
     processing(message, meta = {}) {
         if (this.consoleLevel <= this.levels.info) {
-            console.log(`${this.colors.debug}[PROCESSING] ${message}${this.colors.reset}`);
+            process.stderr.write(`${this.colors.debug}[PROCESSING] ${message}${this.colors.reset}\n`);
         }
         // Always log to file at debug level for troubleshooting
         if (this.logStream && this.fileLevel <= this.levels.debug) {
@@ -296,7 +299,7 @@ class Logger {
 
     substep(message, meta = {}) {
         if (this.debugMode || this.consoleLevel <= this.levels.debug) {
-            console.log(`${this.colors.dim}  └─ ${message}${this.colors.reset}`);
+            process.stderr.write(`${this.colors.dim}  └─ ${message}${this.colors.reset}\n`);
         }
         // Always log substeps to file for detailed troubleshooting
         if (this.logStream && this.fileLevel <= this.levels.debug) {
@@ -386,7 +389,7 @@ class Logger {
             consoleLogLevel: Object.keys(this.levels).find(key => this.levels[key] === this.consoleLevel),
             fileLogLevel: Object.keys(this.levels).find(key => this.levels[key] === this.fileLevel),
             verbose: this.verbose,
-            debug: this.debug,
+            debug: this.debugMode,
             logMCPTools: this.logMCPTools,
             logFile: this.logFile,
             errorFileLogging: !!this.errorLogFile,
@@ -422,13 +425,15 @@ class Logger {
         return false;
     }
 
-    // Close file streams
+    // Close file streams. Also sets _closed so late writes (fire-and-forget
+    // startup checks, for example) don't crash with ERR_STREAM_WRITE_AFTER_END.
     close() {
+        this._closed = true;
         if (this.logStream) {
-            this.logStream.end();
+            try { this.logStream.end(); } catch (_) {}
         }
         if (this.errorStream) {
-            this.errorStream.end();
+            try { this.errorStream.end(); } catch (_) {}
         }
     }
 }

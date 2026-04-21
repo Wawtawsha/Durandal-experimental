@@ -246,12 +246,12 @@ class DatabaseDiscovery {
 
         // Search each path
         for (const searchPath of this.searchPaths) {
-            process.stdout.write(`Searching ${searchPath}...\\r`);
+            process.stdout.write(`Searching ${searchPath}...\r`);
             this.searchDirectory(searchPath);
         }
 
         // Clear the line
-        process.stdout.write('                                                  \\r');
+        process.stdout.write('                                                  \r');
 
         // Remove duplicates
         const seen = new Set();
@@ -268,10 +268,10 @@ class DatabaseDiscovery {
         // Display results
         if (this.foundDatabases.length === 0) {
             console.log('❌ No Durandal databases found on this system.');
-            console.log('\\nA new database will be created at:');
+            console.log('\nA new database will be created at:');
             console.log(`  ${path.join(os.homedir(), '.durandal-mcp', 'durandal-mcp-memory.db')}`);
         } else {
-            console.log(`✅ Found ${this.foundDatabases.length} potential database(s):\\n`);
+            console.log(`✅ Found ${this.foundDatabases.length} potential database(s):\n`);
 
             // Verify each database
             for (const db of this.foundDatabases) {
@@ -321,12 +321,12 @@ class DatabaseDiscovery {
                 console.log('========================================');
                 console.log('RECOMMENDED ACTION:');
                 console.log('========================================');
-                console.log(`\\nSet DATABASE_PATH environment variable to use your existing database:`);
-                console.log(`\\n  export DATABASE_PATH="${validDbs[0].path}"`);
-                console.log(`\\nThis database has ${validDbs[0].recordCount} existing memories.`);
+                console.log(`\nSet DATABASE_PATH environment variable to use your existing database:`);
+                console.log(`\n  export DATABASE_PATH="${validDbs[0].path}"`);
+                console.log(`\nThis database has ${validDbs[0].recordCount} existing memories.`);
 
                 if (validDbs.length > 1) {
-                    console.log(`\\n⚠️  You have ${validDbs.length} valid databases. Consider consolidating them.`);
+                    console.log(`\n⚠️  You have ${validDbs.length} valid databases. Consider consolidating them.`);
                 }
             }
         }
@@ -339,7 +339,7 @@ class DatabaseDiscovery {
 if (require.main === module) {
     const discovery = new DatabaseDiscovery();
     discovery.discover().then(() => {
-        console.log('\\nDiscovery complete.');
+        console.log('\nDiscovery complete.');
     }).catch(err => {
         console.error('Discovery failed:', err);
     });

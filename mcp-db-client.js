@@ -33,11 +33,11 @@ class MCPDatabaseClient {
 
         // Priority 1: Check for explicit override
         if (process.env.DATABASE_PATH) {
-            console.log(`[DB] Using DATABASE_PATH from environment: ${process.env.DATABASE_PATH}`);
+            process.stderr.write(`[DB] Using DATABASE_PATH from environment: ${process.env.DATABASE_PATH}\n`);
             return process.env.DATABASE_PATH;
         }
 
-        console.log('[DB] No DATABASE_PATH set, searching for existing databases...');
+        process.stderr.write('[DB] No DATABASE_PATH set, searching for existing databases...\n');
 
         const homeDir = process.env.HOME || process.env.USERPROFILE || '.';
         const durandalDir = path.join(homeDir, '.durandal-mcp');
@@ -70,307 +70,171 @@ class MCPDatabaseClient {
             }
         }
 
-        // Priority 3: If no quick matches, run exhaustive discovery
-        if (quickDatabases.length === 0) {
-            console.log('[DB] No databases found in standard locations, running exhaustive search...');
-            console.log('[DB] This may take a moment to ensure no data is lost...');
-
-            try {
-                // Try to use the discovery tool if available
-                const DatabaseDiscovery = require('./db-discovery');
-                const discovery = new DatabaseDiscovery();
-
-                // Run synchronous discovery
-                const execSync = require('child_process').execSync;
-                const discoveryResult = execSync('node db-discovery.js', {
-                    cwd: __dirname,
-                    encoding: 'utf8',
-                    stdio: ['pipe', 'pipe', 'pipe']
-                });
-
-                // Parse discovery output to find databases
-                const lines = discoveryResult.split('\n');
-                for (const line of lines) {
-                    const dbMatch = line.match(/📁\s+(.+\.db)$/);
-                    if (dbMatch) {
-                        const dbPath = dbMatch[1];
-                        if (fs.existsSync(dbPath)) {
-                            const stats = fs.statSync(dbPath);
-                            quickDatabases.push({
-                                path: dbPath,
-                                size: stats.size,
-                                discovered: true
-                            });
-                        }
-                    }
-                }
-
-                if (quickDatabases.length > 0) {
-                    console.log(`[DB] Discovery found ${quickDatabases.length} database(s)`);
-                }
-            } catch (e) {
-                // Discovery tool not available or failed, continue with manual search
-                console.log('[DB] Advanced discovery unavailable, using standard search');
-            }
-        }
-
-        // If we found any databases, use smart selection
+        // If we found any databases from the quick check, pick the largest one.
+        // Sort by preferred location first, then by file size as a pragmatic proxy
+        // for "most data" (accurate record count requires async sqlite open, which
+        // we can't do in a constructor — leave that tool to `--discover`).
         if (quickDatabases.length > 0) {
-            let selectedDb;
-
-            if (quickDatabases.length === 1) {
-                // Only one database found, use it
-                selectedDb = quickDatabases[0];
-                console.log(`[DB] Found existing database: ${selectedDb.path}`);
-            } else {
-                // Multiple databases found - select the best one
-                console.log(`[DB] CRITICAL: Found ${quickDatabases.length} databases:`);
-
-                // Get record counts for each database
-                const databasesWithCounts = [];
+            quickDatabases.sort((a, b) => {
+                if (a.isPreferred !== b.isPreferred) return b.isPreferred ? 1 : -1;
+                return b.size - a.size;
+            });
+            const selectedDb = quickDatabases[0];
+            process.stderr.write(`[DB] Found existing database: ${selectedDb.path}\n`);
+            if (quickDatabases.length > 1) {
+                process.stderr.write(`[DB] WARNING: ${quickDatabases.length} candidate databases exist. Set DATABASE_PATH to disambiguate.\n`);
                 for (const db of quickDatabases) {
-                    let recordCount = 0;
-                    try {
-                        // Synchronously check record count
-                        const testDb = new sqlite3.Database(db.path, sqlite3.OPEN_READONLY, (err) => {
-                            if (!err) {
-                                testDb.get("SELECT COUNT(*) as count FROM memories", (err2, row) => {
-                                    if (!err2 && row) {
-                                        recordCount = row.count;
-                                    }
-                                    testDb.close();
-                                });
-                            }
-                        });
-                    } catch (e) {
-                        // Unable to count, use size as proxy
-                        recordCount = Math.floor(db.size / 200); // Estimate ~200 bytes per record
-                    }
-
-                    databasesWithCounts.push({
-                        ...db,
-                        recordCount: recordCount
-                    });
-
-                    console.log(`[DB]   - ${db.path}`);
-                    console.log(`[DB]     Size: ${(db.size / 1024).toFixed(1)} KB`);
-                    if (recordCount > 0) {
-                        console.log(`[DB]     Records: ${recordCount} memories`);
-                    }
+                    process.stderr.write(`[DB]   - ${db.path} (${(db.size / 1024).toFixed(1)} KB)\n`);
                 }
-
-                // Sort by record count first, then by size
-                databasesWithCounts.sort((a, b) => {
-                    if (a.recordCount !== b.recordCount) {
-                        return b.recordCount - a.recordCount;
-                    }
-                    return b.size - a.size;
-                });
-
-                selectedDb = databasesWithCounts[0];
-                console.log(`[DB] SELECTED: Database with most data: ${selectedDb.path}`);
-
-                // Critical warning about multiple databases
-                console.log(`[DB] ⚠️  IMPORTANT: You have multiple databases!`);
-                console.log(`[DB] To use a specific database, set DATABASE_PATH environment variable:`);
-                console.log(`[DB]   export DATABASE_PATH="${selectedDb.path}"`);
-                console.log(`[DB] Consider consolidating databases to prevent data fragmentation.`);
+                process.stderr.write(`[DB] Run 'durandal-mcp --discover' for a full scan.\n`);
             }
-
-            if (selectedDb.discovered) {
-                console.log(`[DB] ✅ Successfully recovered database from non-standard location`);
-                console.log(`[DB] Your data is safe and will be preserved`);
-            }
-
             return selectedDb.path;
         }
 
-        // Priority 4: NO databases found anywhere - safe to create new
-        console.log(`[DB] No existing databases found anywhere on system`);
-        console.log(`[DB] Creating new database at: ${path.join(durandalDir, 'durandal-mcp-memory.db')}`);
+        // No existing databases — create a fresh one in the canonical location.
+        const newPath = path.join(durandalDir, 'durandal-mcp-memory.db');
+        process.stderr.write(`[DB] No existing databases found. Creating new database at: ${newPath}\n`);
 
-        // Ensure directory exists
         if (!fs.existsSync(durandalDir)) {
             fs.mkdirSync(durandalDir, { recursive: true });
-            console.log(`[DB] Created Durandal directory: ${durandalDir}`);
         }
 
-        return path.join(durandalDir, 'durandal-mcp-memory.db');
+        return newPath;
     }
 
     initializeSQLite() {
         const sqlite3 = require('sqlite3').verbose();
 
-        console.log(`[DB] Database: Using SQLite at ${this.dbPath}`);
+        process.stderr.write(`[DB] Using SQLite at ${this.dbPath}\n`);
 
-        this.client = new sqlite3.Database(this.dbPath, (err) => {
-            if (err) {
-                console.error('SQLite connection error:', err.message);
-            } else {
-                this.initializeSQLiteSchema();
-            }
+        // Expose a ready promise so callers can await schema initialization
+        this.ready = new Promise((resolve, reject) => {
+            this.client = new sqlite3.Database(this.dbPath, (err) => {
+                if (err) {
+                    process.stderr.write(`[DB] SQLite connection error: ${err.message}\n`);
+                    return reject(err);
+                }
+                this.initializeSQLiteSchema().then(resolve).catch(reject);
+            });
         });
     }
 
     async initializeSQLiteSchema() {
-        // Simplified schema: single table for all memories instead of 4 complex tables
         const schema = `
             CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 content TEXT NOT NULL,
-                metadata TEXT, -- JSON: {importance, categories, keywords, type, project, session, etc.}
+                metadata TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
             CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(json_extract(metadata, '$.project')) WHERE json_extract(metadata, '$.project') IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(json_extract(metadata, '$.session')) WHERE json_extract(metadata, '$.session') IS NOT NULL;
-
-            -- Legacy compatibility: Keep existing tables for backward compatibility
-            CREATE TABLE IF NOT EXISTS projects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                path TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS conversation_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id INTEGER NOT NULL,
-                session_name TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                last_message_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                is_active BOOLEAN DEFAULT 1,
-                FOREIGN KEY (project_id) REFERENCES projects (id)
-            );
-
-            CREATE TABLE IF NOT EXISTS conversation_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id INTEGER NOT NULL,
-                role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
-                content TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                metadata TEXT,
-                FOREIGN KEY (session_id) REFERENCES conversation_sessions (id)
-            );
         `;
 
         return new Promise((resolve, reject) => {
             this.client.exec(schema, (err) => {
                 if (err) {
-                    console.error('SQLite schema initialization failed:', err.message);
-                    reject(err);
-                } else {
-                    console.log('[OK] SQLite schema initialized');
-                    this.initialized = true;
-                    resolve();
+                    process.stderr.write(`[DB] Schema init failed: ${err.message}\n`);
+                    return reject(err);
                 }
+                this.initialized = true;
+                process.stderr.write('[DB] Schema initialized\n');
+                resolve();
             });
         });
     }
 
     async testConnection() {
+        try {
+            await this.ready;
+        } catch (e) {
+            return { success: false, error: e.message, type: 'sqlite' };
+        }
         return new Promise((resolve) => {
-            this.client.get('SELECT 1 as test', (err, row) => {
+            this.client.get('SELECT 1 as test', (err) => {
                 if (err) {
-                    resolve({
-                        success: false,
-                        error: err.message,
-                        type: 'sqlite'
-                    });
+                    resolve({ success: false, error: err.message, type: 'sqlite' });
                 } else {
-                    resolve({
-                        success: true,
-                        message: 'SQLite connection successful',
-                        type: 'sqlite'
-                    });
+                    resolve({ success: true, message: 'SQLite connection successful', type: 'sqlite' });
                 }
             });
         });
     }
 
     async query(sql, params = []) {
-        return await this.querySQLite(sql, params);
-    }
-
-    async querySQLite(sql, params = []) {
+        await this.ready;
         return new Promise((resolve, reject) => {
-            // Convert PostgreSQL-style parameters ($1, $2) to SQLite-style (?, ?)
-            const sqliteSql = sql.replace(/\$(\d+)/g, '?');
-
             if (sql.trim().toLowerCase().startsWith('select')) {
-                this.client.all(sqliteSql, params, (err, rows) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve({ rows: rows || [] });
-                    }
+                this.client.all(sql, params, (err, rows) => {
+                    if (err) return reject(err);
+                    resolve({ rows: rows || [] });
                 });
             } else {
-                this.client.run(sqliteSql, params, function(err) {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve({
-                            rows: [{ id: this.lastID }],
-                            rowCount: this.changes
-                        });
-                    }
+                this.client.run(sql, params, function(err) {
+                    if (err) return reject(err);
+                    resolve({ rows: [{ id: this.lastID }], rowCount: this.changes });
                 });
             }
         });
     }
 
     async close() {
-        if (this.client) {
-            return new Promise((resolve) => {
-                this.client.close((err) => {
-                    if (err) {
-                        console.error('SQLite close error:', err.message);
-                    }
-                    resolve();
-                });
+        try { await this.ready; } catch (_) { /* schema never inited — close anyway */ }
+        if (!this.client) return;
+        return new Promise((resolve) => {
+            this.client.close((err) => {
+                if (err) process.stderr.write(`[DB] Close error: ${err.message}\n`);
+                resolve();
             });
-        }
+        });
     }
 
-    // Simplified memory operations for MCP server
+    // Escape LIKE wildcards so user-provided queries don't match more than intended.
+    // Uses backslash as the ESCAPE character (applied in SQL with ESCAPE '\').
+    _escapeLike(s) {
+        return s.replace(/[\\%_]/g, '\\$&');
+    }
+
     async storeMemory(content, metadata = {}) {
         try {
+            await this.ready;
+            // Use sqlite's lastID (via run() callback) instead of RETURNING — some
+            // node-sqlite3 builds don't expose rows from RETURNING in run() mode,
+            // so we'd get an undefined id. lastID is always populated for INSERT.
             const result = await this.query(
-                'INSERT INTO memories (content, metadata, created_at) VALUES (?, ?, datetime(\'now\')) RETURNING id',
+                'INSERT INTO memories (content, metadata) VALUES (?, ?)',
                 [content, JSON.stringify(metadata)]
             );
             return { success: true, id: result.rows[0].id };
         } catch (error) {
-            console.warn('storeMemory error:', error.message);
             return { success: false, error: error.message };
         }
     }
 
-    async searchMemories(query, options = {}) {
+    async searchMemories(query, options = {}, limitArg) {
         try {
-            const { limit = 10, project, session } = options;
-            let queryStr = 'SELECT id, content, metadata, created_at FROM memories WHERE content LIKE ?';
-            let queryParams = [`%${query}%`];
+            await this.ready;
+            // Accept limit from options OR positional 3rd arg (keeps db-adapter signature working).
+            const limit = limitArg ?? options.limit ?? 10;
+            const { project, session } = options;
 
-            // Add project filter if specified
+            let sql = "SELECT id, content, metadata, created_at FROM memories WHERE content LIKE ? ESCAPE '\\'";
+            const params = [`%${this._escapeLike(query)}%`];
+
             if (project) {
-                queryStr += ' AND json_extract(metadata, \'$.project\') = ?';
-                queryParams.push(project);
+                sql += " AND json_extract(metadata, '$.project') = ?";
+                params.push(project);
             }
-
-            // Add session filter if specified
             if (session) {
-                queryStr += ' AND json_extract(metadata, \'$.session\') = ?';
-                queryParams.push(session);
+                sql += " AND json_extract(metadata, '$.session') = ?";
+                params.push(session);
             }
+            sql += ' ORDER BY created_at DESC LIMIT ?';
+            params.push(limit);
 
-            queryStr += ' ORDER BY created_at DESC LIMIT ?';
-            queryParams.push(limit);
-
-            const result = await this.query(queryStr, queryParams);
-
+            const result = await this.query(sql, params);
             return result.rows.map(row => ({
                 id: row.id,
                 content: row.content,
@@ -378,36 +242,31 @@ class MCPDatabaseClient {
                 created_at: row.created_at
             }));
         } catch (error) {
-            console.warn('searchMemories error:', error.message);
+            process.stderr.write(`[DB] searchMemories error: ${error.message}\n`);
             return [];
         }
     }
 
     async getRecentMemories(limit = 10, project = null, session = null) {
         try {
-            let queryStr = 'SELECT id, content, metadata, created_at FROM memories';
-            let queryParams = [];
+            await this.ready;
+            let sql = 'SELECT id, content, metadata, created_at FROM memories';
+            const params = [];
             const conditions = [];
 
             if (project) {
-                conditions.push('json_extract(metadata, \'$.project\') = ?');
-                queryParams.push(project);
+                conditions.push("json_extract(metadata, '$.project') = ?");
+                params.push(project);
             }
-
             if (session) {
-                conditions.push('json_extract(metadata, \'$.session\') = ?');
-                queryParams.push(session);
+                conditions.push("json_extract(metadata, '$.session') = ?");
+                params.push(session);
             }
+            if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+            sql += ' ORDER BY created_at DESC LIMIT ?';
+            params.push(limit);
 
-            if (conditions.length > 0) {
-                queryStr += ' WHERE ' + conditions.join(' AND ');
-            }
-
-            queryStr += ' ORDER BY created_at DESC LIMIT ?';
-            queryParams.push(limit);
-
-            const result = await this.query(queryStr, queryParams);
-
+            const result = await this.query(sql, params);
             return result.rows.map(row => ({
                 id: row.id,
                 content: row.content,
@@ -415,31 +274,39 @@ class MCPDatabaseClient {
                 created_at: row.created_at
             }));
         } catch (error) {
-            console.warn('getRecentMemories error:', error.message);
+            process.stderr.write(`[DB] getRecentMemories error: ${error.message}\n`);
             return [];
         }
     }
 
     async getMemoryById(id) {
         try {
+            await this.ready;
             const result = await this.query(
                 'SELECT id, content, metadata, created_at FROM memories WHERE id = ?',
                 [id]
             );
-
-            if (result.rows.length > 0) {
-                const row = result.rows[0];
-                return {
-                    id: row.id,
-                    content: row.content,
-                    metadata: row.metadata ? JSON.parse(row.metadata) : {},
-                    created_at: row.created_at
-                };
-            }
-            return null;
+            if (!result.rows.length) return null;
+            const row = result.rows[0];
+            return {
+                id: row.id,
+                content: row.content,
+                metadata: row.metadata ? JSON.parse(row.metadata) : {},
+                created_at: row.created_at
+            };
         } catch (error) {
-            console.warn('getMemoryById error:', error.message);
+            process.stderr.write(`[DB] getMemoryById error: ${error.message}\n`);
             return null;
+        }
+    }
+
+    async deleteMemoryById(id) {
+        try {
+            await this.ready;
+            const result = await this.query('DELETE FROM memories WHERE id = ?', [id]);
+            return { success: true, changes: result.rowCount || 0 };
+        } catch (error) {
+            return { success: false, error: error.message };
         }
     }
 }

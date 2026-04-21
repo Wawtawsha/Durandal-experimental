@@ -109,36 +109,36 @@ class TestRunner {
     }
 
     /**
-     * Test database schema
+     * Test database schema — the MCP server now uses a single-table schema.
+     * Legacy multi-table (projects/conversation_sessions/conversation_messages)
+     * are no longer created because they were never populated by the MCP path.
      */
     async testSchemaValidation() {
         const db = new MCPDatabaseClient();
 
-        // Check that all required tables exist
-        const tables = ['memories', 'projects', 'conversation_sessions', 'conversation_messages'];
-
-        for (const table of tables) {
-            const result = await db.query(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                [table]
-            );
-
-            if (result.rows.length === 0) {
-                throw new Error(`Missing table: ${table}`);
-            }
+        const memoriesTable = await db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            ['memories']
+        );
+        if (memoriesTable.rows.length === 0) {
+            throw new Error('Missing table: memories');
         }
 
-        // Check memories table structure
-        // Note: SQLite PRAGMA returns different column names in the result set
-        // We'll verify the table exists and has data instead
-        try {
-            // Try to select all required columns
-            await db.query(
-                "SELECT id, content, metadata, created_at FROM memories LIMIT 0"
-            );
-            // If this succeeds, all columns exist
-        } catch (error) {
-            throw new Error(`Schema validation failed: ${error.message}`);
+        // Verify all required columns exist by selecting them
+        await db.query(
+            "SELECT id, content, metadata, created_at FROM memories LIMIT 0"
+        );
+
+        // Verify the project/session indexes exist (performance)
+        const indexes = await db.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
+        );
+        const indexNames = indexes.rows.map(r => r.name);
+        const required = ['idx_memories_created_at', 'idx_memories_project', 'idx_memories_session'];
+        for (const idx of required) {
+            if (!indexNames.includes(idx)) {
+                throw new Error(`Missing index: ${idx}`);
+            }
         }
 
         await db.close();
@@ -277,24 +277,44 @@ class TestRunner {
     }
 
     /**
-     * Test MCP tools availability
+     * Test MCP tools availability — instantiate the server (without starting
+     * stdio transport) and invoke the ListTools handler to confirm the tool
+     * registry is actually wired up.
      */
     async testMCPTools() {
-        // Verify tool definitions
+        const DurandalMCPServer = require('./durandal-mcp-server-v3');
+        const server = new DurandalMCPServer({ logLevel: 'error' });
+
+        // Wait for the async startup check to finish so it doesn't log after close.
+        await server.ready;
+
         const requiredTools = [
             'store_memory',
             'search_memories',
             'get_context',
-            'optimize_memory'
+            'optimize_memory',
+            'get_status',
+            'configure_logging',
+            'get_logs',
+            'list_projects_sessions'
         ];
 
-        // In a real implementation, we'd check the actual MCP server
-        // For now, we just verify the tool names are defined
+        const { ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
+        const handler = server.server._requestHandlers.get(ListToolsRequestSchema.shape.method.value);
+        if (!handler) {
+            throw new Error('ListTools handler not registered');
+        }
+        const result = await handler({ method: 'tools/list', params: {} }, {});
+        const toolNames = (result?.tools || []).map(t => t.name);
+
         for (const tool of requiredTools) {
-            if (!tool) {
-                throw new Error(`Tool ${tool} is not defined`);
+            if (!toolNames.includes(tool)) {
+                throw new Error(`Tool not registered: ${tool}`);
             }
         }
+
+        if (server.db?.close) await server.db.close();
+        if (server.logger?.close) server.logger.close();
     }
 
     /**

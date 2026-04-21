@@ -251,8 +251,11 @@ class UpdateChecker {
         if (!this.config.showNotification) return;
         if (!updateInfo || !updateInfo.updateAvailable) return;
 
+        // Write to stderr — stdout is reserved for MCP stdio protocol messages
+        // when the server is running as an MCP server. This is safe in both
+        // MCP mode and standalone CLI mode.
         const notification = this.formatUpdateNotification(updateInfo);
-        console.log(notification);
+        process.stderr.write(notification + '\n');
     }
 
     async performUpdate(options = {}) {

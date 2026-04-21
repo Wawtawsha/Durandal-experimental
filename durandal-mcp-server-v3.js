@@ -99,8 +99,9 @@ class DurandalMCPServer extends EventEmitter {
             selectiveAttention: this.config.selectiveAttention
         });
 
-        // Run database startup check
-        this.runDatabaseStartupCheck();
+        // Run database startup check — expose as a promise so tests/shutdown
+        // can await completion instead of racing with fire-and-forget logging.
+        this.ready = this.runDatabaseStartupCheck();
 
         this.setupHandlers();
     }
@@ -616,57 +617,41 @@ class DurandalMCPServer extends EventEmitter {
     async handleStoreMemory(args, requestId) {
         this.logger.processing('Processing store_memory request from Claude');
 
-        // Validate input
         if (!args.content || typeof args.content !== 'string') {
             throw new ValidationError('Content must be a non-empty string', 'content', args.content);
         }
-
         if (args.content.length > 50000) {
             throw new ValidationError('Content exceeds maximum length (50000 characters)', 'content', args.content.length);
         }
 
         const metadata = args.metadata || {};
-
-        // Validate metadata
         if (metadata.importance !== undefined) {
             if (typeof metadata.importance !== 'number' || metadata.importance < 0 || metadata.importance > 1) {
                 throw new ValidationError('Importance must be a number between 0 and 1', 'metadata.importance', metadata.importance);
             }
         }
 
-        // Add project and session to metadata if not specified
-        if (!metadata.project) {
-            metadata.project = 'default';
-        }
-        if (!metadata.session) {
-            metadata.session = new Date().toISOString().split('T')[0]; // Use date as default session
-        }
+        if (!metadata.project) metadata.project = 'default';
+        if (!metadata.session) metadata.session = new Date().toISOString().split('T')[0];
 
-        // Generate memory ID
-        const memoryId = this.generateMemoryId();
-
-        this.logger.substep('Analyzing content');
-
-        // Enrich metadata
         const enrichedMetadata = this.enrichMetadata(metadata);
 
-        this.logger.substep('Storing to cache');
-
-        // Store in cache first
-        this.storeInCache(memoryId, args.content, enrichedMetadata);
-
+        // Write to DB first and await — the DB's autoincrement id is the canonical one.
+        // Previously this fire-and-forgot the write and returned a client-generated id
+        // that never matched the stored row, breaking get-by-id and cache dedup.
         this.logger.substep('Storing to database');
+        const dbResult = await this.db.storeMemory(args.content, enrichedMetadata);
+        if (!dbResult || !dbResult.success) {
+            throw new DatabaseError(
+                'Failed to store memory',
+                'store',
+                new Error(dbResult?.error || 'unknown database error')
+            );
+        }
+        const memoryId = dbResult.id;
 
-        // Store in database (async, don't wait)
-        this.storeInDatabase(memoryId, args.content, enrichedMetadata).catch(error => {
-            this.logger.error('Failed to store in database', {
-                requestId,
-                memoryId,
-                error: error.message
-            });
-        });
-
-        // Update access patterns for RAMR
+        this.logger.substep('Caching under DB id');
+        this.storeInCache(memoryId, args.content, enrichedMetadata);
         this.updateAccessPatterns(memoryId, 'store');
 
         this.logger.success(`Memory stored (id: ${memoryId})`, {
@@ -681,13 +666,10 @@ class DurandalMCPServer extends EventEmitter {
                 type: 'text',
                 text: `[OK] Memory stored successfully\n\n` +
                       `**ID:** ${memoryId}\n` +
-                      `**Project:** ${enrichedMetadata.project || 'default'}\n` +
-                      `**Session:** ${enrichedMetadata.session || 'current'}\n` +
-                      `**Importance:** ${enrichedMetadata.importance || 'Not set'}\n` +
-                      `**Categories:** ${enrichedMetadata.categories?.join(', ') || 'None'}\n` +
-                      `**Cache Priority:** ${enrichedMetadata.ramr?.cache_priority || 'Normal'}\n\n` +
-                      `💡 **Tip:** You can specify project and session in metadata to organize memories:\n` +
-                      `   metadata: { project: "my-app", session: "feature-x" }`
+                      `**Project:** ${enrichedMetadata.project}\n` +
+                      `**Session:** ${enrichedMetadata.session}\n` +
+                      `**Importance:** ${enrichedMetadata.importance ?? 'Not set'}\n` +
+                      `**Categories:** ${enrichedMetadata.categories?.join(', ') || 'None'}`
             }]
         };
     }
@@ -1812,13 +1794,24 @@ SQLite3: ${pkg.dependencies.sqlite3}
         }
 
         const logFileIndex = args.indexOf('--log-file');
-        if (logFileIndex > -1 && args[logFileIndex + 1]) {
-            options.logFile = args[logFileIndex + 1];
+        if (logFileIndex > -1) {
+            const val = args[logFileIndex + 1];
+            if (!val || val.startsWith('--')) {
+                console.error('Error: --log-file requires a file path argument');
+                process.exit(2);
+            }
+            options.logFile = val;
         }
 
         const logLevelIndex = args.indexOf('--log-level');
-        if (logLevelIndex > -1 && args[logLevelIndex + 1]) {
-            options.logLevel = args[logLevelIndex + 1];
+        if (logLevelIndex > -1) {
+            const val = args[logLevelIndex + 1];
+            const validLevels = ['debug', 'info', 'warn', 'error'];
+            if (!val || !validLevels.includes(val)) {
+                console.error(`Error: --log-level must be one of ${validLevels.join(', ')}`);
+                process.exit(2);
+            }
+            options.logLevel = val;
         }
 
         // Start server
@@ -1960,8 +1953,15 @@ async function configureLogLevel() {
 
     const fileLevel = fileChoice === '' ? 'info' : levels[fileChoice];
 
-    // Save configuration
-    const envPath = path.join(__dirname, '.env');
+    // Save configuration to the SAME location the server reads on startup
+    // (loadPersistedConfig reads from ~/.durandal-mcp/.env). Previously this
+    // wrote to the install directory and the changes were silently ignored.
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '.';
+    const configDir = path.join(homeDir, '.durandal-mcp');
+    if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
+    }
+    const envPath = path.join(configDir, '.env');
     let envContent = '';
 
     if (fs.existsSync(envPath)) {

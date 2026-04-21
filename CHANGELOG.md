@@ -5,6 +5,109 @@ All notable changes to Durandal MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0-experimental] - 2026-04-21 (autonomous-experiment branch, unreleased)
+
+### Core Change
+Comprehensive overhaul of the MCP server across six phases (bugs → logical
+structure → failure vectors → modernization → functionality → new capabilities),
+iterated twice until returns diminished. Produced on the `autonomous-experiment`
+branch; not published to npm.
+
+### Protocol-breaking fixes
+- Routed all console output to stderr; stdout is reserved for MCP JSON-RPC.
+  Previously `console.log` from the DB layer corrupted the wire protocol.
+- `store_memory` now returns the database's autoincrement id after an awaited
+  insert, instead of a client-generated string that never matched the stored
+  row (was silently breaking every id-based workflow).
+
+### New tools
+- `get_memory(id)` — fetch one memory.
+- `delete_memory(id)` — delete one memory.
+- `store_memories_batch(items)` — transactional bulk insert (~100× faster).
+- `update_memory(id, content?, metadata?)` — update existing row in place.
+- `list_memories(project?, session?, since?, until?, limit, offset)` —
+  paginated browse without needing a search query.
+- `export_memories()` / `import_memories(items)` — JSON backup/restore.
+- `rename_project(from, to)` — rename project across all metadata rows.
+- `backup_database(destination)` — atomic snapshot via SQLite `VACUUM INTO`.
+- `delete_memories_where(project?, session?, older_than?)` — bulk delete
+  with guardrail (rejects unfiltered deletes).
+
+### New MCP capabilities (first-class protocol features)
+- Resource template `durandal://memory/{id}` for URI-addressable memories.
+- Prompt template `summarize_recent_memories` that inlines a project's
+  recent memories into a ready-to-send user message.
+- Resources and prompts capabilities now advertised alongside tools.
+
+### Search quality
+- Replaced LIKE-substring with SQLite FTS5 (porter-unicode61 tokenizer).
+- Tokenized AND-match means `"react typescript"` correctly requires both
+  tokens instead of only matching the literal contiguous substring.
+- BM25 relevance ranking replaces recency-only ordering.
+- `snippet()` highlighting wraps matched tokens with `**...**` in results.
+- LIKE now properly escapes `%` and `_` in user queries.
+- Automatic FTS backfill for databases created before FTS was added.
+
+### Maintenance
+- `optimize_memory` operations are now real SQLite commands
+  (`vacuum`, `analyze`, `integrity_check`, `wal_checkpoint`). The previous
+  `cache_optimization`/`retention_review`/`pattern_analysis`/
+  `relationship_update` operations were placeholders returning static numbers.
+- `optimize_memory` reports before/after DB size so `vacuum` shows reclaimed
+  bytes.
+
+### Hardening
+- Metadata must be an object; strings/arrays/null now rejected.
+- `project`, `session`, `type`, `categories`, `keywords` all type-checked.
+- Serialized metadata capped at 64 KB.
+- Circular-reference metadata caught with a clear error.
+- Per-row `JSON.parse` safety: one corrupt row no longer wipes the whole
+  result set.
+- `get_logs` streams the log file through a readline rolling buffer instead
+  of loading the entire file into memory.
+- `shutdown()` is idempotent and performs a WAL checkpoint before exit.
+- `uncaughtException` now exits with status 1 (was 0, masking crashes).
+- Test suite runs against a temp database in OS temp dir and cleans up,
+  instead of polluting the user's real database with 100+ perf-test rows.
+
+### Modernization
+- MCP SDK upgraded 1.17.5 → 1.29.0.
+- Server rewritten to use high-level `McpServer.registerTool` with Zod
+  input schemas; eliminates the setRequestHandler dispatch switch and the
+  hand-rolled JSON Schema blocks.
+- Every tool now declares MCP 1.29 annotations (readOnly/destructive/
+  idempotent/openWorld hints).
+- Every tool returns `structuredContent` alongside text for typed clients.
+
+### Internal
+- Removed the in-memory "RAMR cache" / "selective attention" machinery —
+  a plain Map masquerading as a cache, with no invalidation, whose "cache
+  priority" was computed but never actually prioritized anything. Was the
+  root cause of the client-id-vs-DB-id dedup bug.
+- Removed ~180 lines of dead PostgreSQL-syntax methods in `db-adapter.js`
+  that used `$1`/`NOW()`/`ILIKE`/`RETURNING` against the SQLite-only schema.
+- Removed legacy `projects`/`conversation_sessions`/`conversation_messages`
+  tables from schema init — never populated by MCP code.
+- `--configure` now writes to `~/.durandal-mcp/.env` (the location the
+  server actually reads on startup). Previously wrote to the install
+  directory and was silently ignored.
+- CLI `--log-file`/`--log-level` now validate their arguments.
+- Logger guards against write-after-end from late fire-and-forget logs.
+- `configure_logging` env regex anchored to `^KEY=$` to avoid matching
+  `FOO_CONSOLE_LOG_LEVEL_BAR=x`.
+- ~125 non-MCP-package files (legacy Durandal application + design docs +
+  retrospectives) moved to `legacy/` subdirectory; root now contains only
+  the published files.
+
+### Tests
+- `test-runner.js` still runs with `npm test`; tests are DB-isolated.
+- `test-mcp-smoke.js` added: spawns the server, speaks raw JSON-RPC over
+  stdio, exercises ~25 scenarios including protocol correctness
+  (no stdout pollution), FTS tokenization, filter validation, bulk
+  operations, resources, prompts, backup, and bulk-delete.
+
+---
+
 ## [3.2.5] - 2025-09-30
 
 ### Core Change: Critical Database Method Fixes

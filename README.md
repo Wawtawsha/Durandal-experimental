@@ -57,24 +57,58 @@ Just talk naturally to Claude Code. The memory system activates automatically:
 
 ## Features
 
-- **Persistent Memory**: Remembers across Claude Code sessions
-- **Smart Search**: Find information using natural language
-- **Auto-Categorization**: Organizes memories by type and importance
-- **Zero Configuration**: Works immediately after installation
-- **SQLite Database**: Automatically created on first use
-- **Local Storage**: All data stays on your machine
+- **Persistent memory** across Claude Code sessions.
+- **Full-text search** (SQLite FTS5) with BM25 relevance ranking and
+  snippet highlighting — `"react typescript"` correctly matches rows with
+  both tokens.
+- **Zero configuration** — SQLite database is created automatically at
+  `~/.durandal-mcp/durandal-mcp-memory.db` on first use.
+- **Structured tool responses** — every tool returns `structuredContent`
+  alongside text for typed clients.
+- **MCP resources and prompts** — memories are also addressable via
+  `durandal://memory/{id}` and come with a ready-made summarization prompt.
+- **Safe by default** — bulk deletes require a filter, metadata is size-
+  capped and type-checked, one corrupt row can't wipe your result set.
+- **Local-only** — all data stays on your machine.
 
 ## MCP Tools Available
 
-The server exposes these tools to Claude Code:
+The server exposes the following tools to Claude Code:
 
-- `store_memory` - Store content with metadata
-- `search_memories` - Search with filters and queries
-- `get_context` - Retrieve recent memories and statistics
-- `optimize_memory` - Run memory system optimization
-- `get_status` - Display system status dashboard
-- `configure_logging` - Change log levels at runtime
-- `get_logs` - Retrieve session history for debugging
+**Core memory operations**
+- `store_memory(content, metadata?)` — store a memory; returns the new id.
+- `get_memory(id)` — fetch one memory by id.
+- `update_memory(id, content?, metadata?)` — edit an existing memory.
+- `delete_memory(id)` — delete one memory.
+- `search_memories(query, filters?, limit?)` — full-text search with BM25
+  relevance ranking (tokenized AND-match; `"react typescript"` requires both).
+- `get_context(project?, session?, limit?, include_stats?)` — recent memories
+  scoped to a project/session.
+- `list_memories(project?, session?, since?, until?, limit, offset)` —
+  paginated browse without a search query.
+
+**Bulk operations**
+- `store_memories_batch(items)` — transactional bulk insert.
+- `export_memories()` — dump all memories as JSON for backup.
+- `import_memories(items)` — insert memories from a JSON array.
+- `rename_project(from, to)` — rename a project across all rows.
+- `delete_memories_where(project?, session?, older_than?)` — bulk delete
+  (requires at least one filter).
+
+**Maintenance and admin**
+- `optimize_memory(operations)` — run SQLite maintenance
+  (`vacuum`, `analyze`, `integrity_check`, `wal_checkpoint`).
+- `backup_database(destination)` — atomic snapshot via `VACUUM INTO`.
+- `get_status()` — server status, database stats, FTS availability.
+- `list_projects_sessions(type?, include_samples?, limit?)` — summary of
+  distinct projects and sessions.
+- `configure_logging(console_level?, file_level?)` — runtime log level.
+- `get_logs(lines?, level_filter?, search?)` — recent log entries.
+
+**MCP resources and prompts**
+- Resource template `durandal://memory/{id}` — URI-addressable memories.
+- Prompt `summarize_recent_memories(project?, limit?)` — ready-made prompt
+  that embeds recent memories for Claude to summarize.
 
 ## File Structure
 

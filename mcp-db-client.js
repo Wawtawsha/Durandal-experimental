@@ -528,6 +528,268 @@ class MCPDatabaseClient {
         }
     }
 
+    // Iter 3: structured stats — replaces handlers reaching into this.client.
+    async stats({ project } = {}) {
+        try {
+            await this.ready;
+            const total = await this.query('SELECT COUNT(*) as c FROM memories');
+            const projects = await this.query(
+                "SELECT COUNT(DISTINCT json_extract(metadata, '$.project')) as c FROM memories WHERE json_extract(metadata, '$.project') IS NOT NULL"
+            );
+            const sessions = await this.query(
+                "SELECT COUNT(DISTINCT json_extract(metadata, '$.session')) as c FROM memories WHERE json_extract(metadata, '$.session') IS NOT NULL"
+            );
+            const out = {
+                total: total.rows[0]?.c || 0,
+                projects: projects.rows[0]?.c || 0,
+                sessions: sessions.rows[0]?.c || 0
+            };
+            if (project) {
+                const p = await this.query(
+                    "SELECT COUNT(*) as c FROM memories WHERE json_extract(metadata, '$.project') = ?",
+                    [project]
+                );
+                out.inProject = p.rows[0]?.c || 0;
+            }
+            return out;
+        } catch (e) {
+            process.stderr.write(`[DB] stats error: ${e.message}\n`);
+            return { total: 0, projects: 0, sessions: 0, inProject: project ? 0 : undefined };
+        }
+    }
+
+    // Iter 3: total match count for FTS results — used for client pagination.
+    async countSearchMatches(query, { project, session } = {}) {
+        try {
+            await this.ready;
+            if (this.ftsAvailable) {
+                const ftsQuery = this._toFtsQuery(query);
+                if (ftsQuery) {
+                    let sql = `
+                        SELECT COUNT(*) as c
+                        FROM memories_fts
+                        JOIN memories m ON memories_fts.rowid = m.id
+                        WHERE memories_fts MATCH ?
+                    `;
+                    const params = [ftsQuery];
+                    if (project) { sql += " AND json_extract(m.metadata, '$.project') = ?"; params.push(project); }
+                    if (session) { sql += " AND json_extract(m.metadata, '$.session') = ?"; params.push(session); }
+                    try {
+                        const r = await this.query(sql, params);
+                        return r.rows[0]?.c || 0;
+                    } catch (_) { /* fall through */ }
+                }
+            }
+            // LIKE fallback
+            let sql = "SELECT COUNT(*) as c FROM memories WHERE content LIKE ? ESCAPE '\\'";
+            const params = [`%${this._escapeLike(query)}%`];
+            if (project) { sql += " AND json_extract(metadata, '$.project') = ?"; params.push(project); }
+            if (session) { sql += " AND json_extract(metadata, '$.session') = ?"; params.push(session); }
+            const r = await this.query(sql, params);
+            return r.rows[0]?.c || 0;
+        } catch (e) {
+            process.stderr.write(`[DB] countSearchMatches error: ${e.message}\n`);
+            return 0;
+        }
+    }
+
+    // Iter 3: total count for listMemories filters (pagination total).
+    async countList({ project, session, since, until } = {}) {
+        try {
+            await this.ready;
+            let sql = 'SELECT COUNT(*) as c FROM memories';
+            const conditions = [];
+            const params = [];
+            if (project) { conditions.push("json_extract(metadata, '$.project') = ?"); params.push(project); }
+            if (session) { conditions.push("json_extract(metadata, '$.session') = ?"); params.push(session); }
+            if (since) { conditions.push('created_at >= ?'); params.push(since); }
+            if (until) { conditions.push('created_at <= ?'); params.push(until); }
+            if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+            const r = await this.query(sql, params);
+            return r.rows[0]?.c || 0;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    // Iter 3: aggregate projects/sessions in one go, with samples joined via
+    // GROUP_CONCAT instead of N+1 follow-up queries. groupByField is either
+    // 'project' or 'session'.
+    async groupSummary(groupByField, { limit = 50, includeSamples = false } = {}) {
+        try {
+            await this.ready;
+            if (!['project', 'session'].includes(groupByField)) {
+                throw new Error(`groupByField must be 'project' or 'session'`);
+            }
+            const path = `$.${groupByField}`;
+            const sql = `
+                SELECT
+                    json_extract(metadata, ?) as name,
+                    COUNT(*) as count,
+                    MIN(created_at) as first_memory,
+                    MAX(created_at) as last_memory
+                FROM memories
+                WHERE json_extract(metadata, ?) IS NOT NULL
+                GROUP BY json_extract(metadata, ?)
+                ORDER BY ${groupByField === 'project' ? 'count' : 'last_memory'} DESC
+                LIMIT ?
+            `;
+            const r = await this.query(sql, [path, path, path, limit]);
+            const items = r.rows.map(row => ({
+                name: row.name,
+                memoryCount: row.count,
+                firstMemory: row.first_memory,
+                lastMemory: row.last_memory
+            }));
+
+            // Samples: one batched query that ranks rows within each group and
+            // pulls the top 2 per group. Replaces the prior N+1 pattern.
+            if (includeSamples && items.length) {
+                const names = items.map(i => i.name);
+                const placeholders = names.map(() => '?').join(',');
+                const sampleSql = `
+                    SELECT name, content, created_at FROM (
+                        SELECT
+                            json_extract(metadata, ?) as name,
+                            content,
+                            created_at,
+                            ROW_NUMBER() OVER (PARTITION BY json_extract(metadata, ?) ORDER BY created_at DESC) as rn
+                        FROM memories
+                        WHERE json_extract(metadata, ?) IN (${placeholders})
+                    )
+                    WHERE rn <= 2
+                    ORDER BY name, rn
+                `;
+                const samples = await this.query(sampleSql, [path, path, path, ...names]);
+                const byName = new Map();
+                for (const s of samples.rows) {
+                    if (!byName.has(s.name)) byName.set(s.name, []);
+                    byName.get(s.name).push({ content: s.content, created_at: s.created_at });
+                }
+                for (const item of items) {
+                    item.samples = byName.get(item.name) || [];
+                }
+            }
+            return items;
+        } catch (e) {
+            process.stderr.write(`[DB] groupSummary error: ${e.message}\n`);
+            return [];
+        }
+    }
+
+    // Iter 3: schema/integrity helpers — used to be inline in the server's
+    // runDatabaseStartupCheck via this.db.db.client reach-through.
+    async listTables() {
+        await this.ready;
+        return new Promise((resolve, reject) => {
+            this.client.all("SELECT name FROM sqlite_master WHERE type='table'", (err, rows) =>
+                err ? reject(err) : resolve(rows.map(r => r.name))
+            );
+        });
+    }
+
+    async tableColumns(table) {
+        await this.ready;
+        return new Promise((resolve, reject) => {
+            this.client.all(`PRAGMA table_info(${table.replace(/[^a-zA-Z0-9_]/g, '')})`, (err, rows) =>
+                err ? reject(err) : resolve(rows.map(r => r.name))
+            );
+        });
+    }
+
+    async integrityCheck() {
+        await this.ready;
+        return new Promise((resolve, reject) => {
+            this.client.all('PRAGMA integrity_check', (err, rows) => err ? reject(err) : resolve(rows));
+        });
+    }
+
+    async exec(sql) {
+        await this.ready;
+        return new Promise((resolve, reject) => {
+            this.client.exec(sql, (err) => err ? reject(err) : resolve());
+        });
+    }
+
+    async pragma(sql) {
+        await this.ready;
+        return new Promise((resolve, reject) => {
+            this.client.get(sql, (err, row) => err ? reject(err) : resolve(row));
+        });
+    }
+
+    // Iter 3: "more like this". Uses the source memory's content as an FTS
+    // query (top-N most distinctive tokens) and returns matches excluding
+    // the source itself. Fall back to LIKE on the first 64 chars if FTS
+    // isn't available.
+    async findSimilar(id, { limit = 5 } = {}) {
+        try {
+            await this.ready;
+            const source = await this.getMemoryById(id);
+            if (!source) return null;
+
+            // Tokenize the source content the same way we tokenize search queries.
+            const tokens = String(source.content)
+                .split(/[^\p{L}\p{N}_]+/u)
+                .filter(t => t.length >= 3) // drop ultra-short tokens (a, of, etc.)
+                .slice(0, 12); // cap query complexity
+
+            if (this.ftsAvailable && tokens.length) {
+                const ftsQuery = tokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+                try {
+                    const sql = `
+                        SELECT m.id, m.content, m.metadata, m.created_at, bm25(memories_fts) AS rank
+                        FROM memories_fts
+                        JOIN memories m ON memories_fts.rowid = m.id
+                        WHERE memories_fts MATCH ?
+                          AND m.id != ?
+                        ORDER BY rank
+                        LIMIT ?
+                    `;
+                    const r = await this.query(sql, [ftsQuery, id, limit]);
+                    return r.rows.map((row) => {
+                        const parsed = this._parseRow(row);
+                        parsed.relevance = row.rank;
+                        return parsed;
+                    });
+                } catch (_) { /* fall through to LIKE */ }
+            }
+
+            // LIKE fallback
+            const stem = source.content.slice(0, 64);
+            const r = await this.query(
+                "SELECT id, content, metadata, created_at FROM memories WHERE content LIKE ? ESCAPE '\\' AND id != ? ORDER BY created_at DESC LIMIT ?",
+                [`%${this._escapeLike(stem)}%`, id, limit]
+            );
+            return r.rows.map(row => this._parseRow(row));
+        } catch (e) {
+            process.stderr.write(`[DB] findSimilar error: ${e.message}\n`);
+            return [];
+        }
+    }
+
+    // Iter 3: additive category tag operations. Lighter than update_memory
+    // (which replaces the whole metadata blob).
+    async tagMemory(id, { add = [], remove = [] } = {}) {
+        try {
+            await this.ready;
+            const existing = await this.getMemoryById(id);
+            if (!existing) return { success: false, error: 'not_found' };
+            const meta = { ...(existing.metadata || {}) };
+            const current = new Set(Array.isArray(meta.categories) ? meta.categories : []);
+            for (const t of add) current.add(t);
+            for (const t of remove) current.delete(t);
+            meta.categories = [...current];
+            await this.query(
+                'UPDATE memories SET metadata = ? WHERE id = ?',
+                [JSON.stringify(meta), id]
+            );
+            return { success: true, categories: meta.categories };
+        } catch (e) {
+            return { success: false, error: e.message };
+        }
+    }
+
     // Iteration 2: bulk delete by filter. Returns number of rows deleted.
     // Same filter shape as listMemories.
     async deleteMemoriesWhere({ project, session, olderThan }) {

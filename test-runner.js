@@ -333,7 +333,9 @@ class TestRunner {
             'import_memories',
             'rename_project',
             'backup_database',
-            'delete_memories_where'
+            'delete_memories_where',
+            'find_similar',
+            'tag_memory'
         ];
 
         // In SDK 1.29 the high-level McpServer exposes registered tools on

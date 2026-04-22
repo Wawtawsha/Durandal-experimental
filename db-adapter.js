@@ -69,6 +69,21 @@ class DatabaseAdapter {
         return await this.db.deleteMemoriesWhere(filters);
     }
 
+    // Iter 3 abstractions — handlers no longer need to reach this.db.db.*
+    async findSimilar(id, opts) { return await this.db.findSimilar(id, opts); }
+    async tagMemory(id, ops) { return await this.db.tagMemory(id, ops); }
+    async stats(opts) { return await this.db.stats(opts); }
+    async countSearchMatches(query, opts) { return await this.db.countSearchMatches(query, opts); }
+    async countList(opts) { return await this.db.countList(opts); }
+    async groupSummary(field, opts) { return await this.db.groupSummary(field, opts); }
+    async listTables() { return await this.db.listTables(); }
+    async tableColumns(t) { return await this.db.tableColumns(t); }
+    async integrityCheck() { return await this.db.integrityCheck(); }
+    async exec(sql) { return await this.db.exec(sql); }
+    async pragma(sql) { return await this.db.pragma(sql); }
+    get dbPath() { return this.db.dbPath; }
+    get ftsAvailable() { return this.db.ftsAvailable === true; }
+
     async close() {
         if (this.db?.close) await this.db.close();
     }

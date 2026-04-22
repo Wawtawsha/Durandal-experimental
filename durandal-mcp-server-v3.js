@@ -56,6 +56,17 @@ const filtersSchema = z.object({
 
 const logLevel = z.enum(['error', 'warn', 'info', 'debug']);
 
+// Iter 3: outputSchema fragments for tools whose structuredContent is part
+// of the public contract. Clients with typed tool support can rely on these.
+// We don't declare an outputSchema for tools whose response shape is opaque
+// or varies (configure_logging, get_logs, optimize_memory).
+const memoryRowSchema = z.object({
+    id: z.number().int(),
+    content: z.string(),
+    metadata: z.object({}).passthrough(),
+    created_at: z.string()
+});
+
 // -----------------------------------------------------------------------------
 // Server class
 // -----------------------------------------------------------------------------
@@ -111,7 +122,7 @@ class DurandalMCPServer extends EventEmitter {
             return JSON.parse(fs.readFileSync(packagePath, 'utf8'));
         } catch (error) {
             this.logger?.warn('Could not load package.json', { error: error.message });
-            return { version: '3.0.0', description: 'Durandal MCP Server' };
+            return { version: 'unknown', description: 'Durandal MCP Server' };
         }
     }
 
@@ -181,18 +192,11 @@ class DurandalMCPServer extends EventEmitter {
 
     async validateDatabaseSchema() {
         try {
-            const client = this.db.db.client;
-            const tables = await new Promise((resolve, reject) => {
-                client.all("SELECT name FROM sqlite_master WHERE type='table'", (err, rows) =>
-                    err ? reject(err) : resolve(rows.map(r => r.name)));
-            });
+            const tables = await this.db.listTables();
             if (!tables.includes('memories')) {
                 return { valid: false, issues: ['missing memories table'] };
             }
-            const cols = await new Promise((resolve, reject) => {
-                client.all('PRAGMA table_info(memories)', (err, rows) =>
-                    err ? reject(err) : resolve(rows.map(r => r.name)));
-            });
+            const cols = await this.db.tableColumns('memories');
             const missing = ['id', 'content'].filter(c => !cols.includes(c));
             if (missing.length) return { valid: false, issues: [`missing columns: ${missing.join(', ')}`] };
             return { valid: true, issues: [] };
@@ -217,10 +221,7 @@ class DurandalMCPServer extends EventEmitter {
 
     async checkDatabaseIntegrity() {
         try {
-            const rows = await new Promise((resolve, reject) => {
-                this.db.db.client.all('PRAGMA integrity_check', (err, r) =>
-                    err ? reject(err) : resolve(r));
-            });
+            const rows = await this.db.integrityCheck();
             const ok = rows.length === 1 && rows[0].integrity_check === 'ok';
             return ok ? { ok: true, errors: [] } : { ok: false, errors: rows.map(r => r.integrity_check) };
         } catch (error) {
@@ -235,15 +236,33 @@ class DurandalMCPServer extends EventEmitter {
     // Wrap each handler so it logs uniformly and surfaces validation errors as
     // isError:true MCP responses with a recovery hint, which the 1.29 spec uses
     // to give clients a structured way to handle tool failures.
+    //
+    // Iter 3 also emits MCP `notifications/message` log events through the
+    // protocol so connected clients see a record of every tool call without
+    // needing access to the server's stderr.
     wrapHandler(toolName, handler) {
         return async (args) => {
             const requestId = this.logger.startMCPTool(toolName, args);
+            const started = Date.now();
+            this._emitMcpLog('debug', { event: 'tool_call_start', tool: toolName });
             try {
                 const result = await handler.call(this, args || {}, requestId);
                 this.logger.endMCPTool(requestId, true, result);
+                this._emitMcpLog('info', {
+                    event: 'tool_call_complete',
+                    tool: toolName,
+                    duration_ms: Date.now() - started,
+                    isError: result?.isError === true
+                });
                 return result;
             } catch (error) {
                 this.logger.endMCPTool(requestId, false, null, error);
+                this._emitMcpLog('error', {
+                    event: 'tool_call_error',
+                    tool: toolName,
+                    duration_ms: Date.now() - started,
+                    error: error.message
+                });
                 const wrapped = this.errorHandler.handle(error, requestId);
                 return {
                     isError: true,
@@ -256,6 +275,20 @@ class DurandalMCPServer extends EventEmitter {
         };
     }
 
+    // MCP log notification — best-effort, swallows transport errors so a
+    // disconnected client can never break tool execution. isConnected()
+    // returns false during startup before transport.connect resolves.
+    _emitMcpLog(level, data) {
+        try {
+            if (typeof this.server?.isConnected === 'function' && !this.server.isConnected()) return;
+            this.server.sendLoggingMessage({
+                level,
+                logger: 'durandal-memory',
+                data
+            }).catch(() => {});
+        } catch (_) { /* best-effort */ }
+    }
+
     registerTools() {
         const R = (name, config, handler) => this.server.registerTool(name, config, this.wrapHandler(name, handler));
 
@@ -265,6 +298,13 @@ class DurandalMCPServer extends EventEmitter {
             inputSchema: {
                 content: z.string().min(1).max(50000).describe('The text to remember'),
                 metadata: metadataSchema.optional().describe('Optional tagging/categorization metadata')
+            },
+            outputSchema: {
+                id: z.number().int(),
+                project: z.string(),
+                session: z.string(),
+                importance: z.number().nullable(),
+                categories: z.array(z.string())
             },
             annotations: {
                 readOnlyHint: false,
@@ -281,6 +321,14 @@ class DurandalMCPServer extends EventEmitter {
                 query: z.string().min(1).describe('Search query. Tokens are AND-ed; "react typescript" matches rows with both words.'),
                 filters: filtersSchema.optional(),
                 limit: z.number().int().min(1).max(100).optional().default(10)
+            },
+            outputSchema: {
+                count: z.number().int(),
+                total: z.number().int().describe('Total matches across the database for this query+filters (before limit).'),
+                results: z.array(memoryRowSchema.extend({
+                    relevance: z.number().nullable(),
+                    snippet: z.string().nullable()
+                }))
             },
             annotations: { readOnlyHint: true, openWorldHint: false }
         }, this.handleSearchMemories);
@@ -351,6 +399,11 @@ class DurandalMCPServer extends EventEmitter {
             title: 'Get Memory By ID',
             description: 'Fetch a single memory by its numeric id.',
             inputSchema: { id: z.number().int().positive() },
+            outputSchema: {
+                found: z.boolean(),
+                id: z.number().int().optional(),
+                memory: memoryRowSchema.optional()
+            },
             annotations: { readOnlyHint: true, openWorldHint: false }
         }, this.handleGetMemory);
 
@@ -396,6 +449,13 @@ class DurandalMCPServer extends EventEmitter {
                 until: z.string().optional().describe('ISO 8601 end timestamp (inclusive)'),
                 limit: z.number().int().min(1).max(500).optional().default(50),
                 offset: z.number().int().min(0).optional().default(0)
+            },
+            outputSchema: {
+                count: z.number().int(),
+                total: z.number().int().describe('Total rows matching the filters (before limit/offset).'),
+                offset: z.number().int(),
+                limit: z.number().int(),
+                memories: z.array(memoryRowSchema)
             },
             annotations: { readOnlyHint: true, openWorldHint: false }
         }, this.handleListMemories);
@@ -453,6 +513,41 @@ class DurandalMCPServer extends EventEmitter {
             },
             annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }
         }, this.handleDeleteMemoriesWhere);
+
+        // --- Iter 3 additions ---
+
+        R('find_similar', {
+            title: 'Find Similar Memories',
+            description: 'Find memories similar to the given one using FTS5 (token-overlap with BM25 ranking, OR-of-tokens). Excludes the source memory.',
+            inputSchema: {
+                id: z.number().int().positive(),
+                limit: z.number().int().min(1).max(50).optional().default(5)
+            },
+            outputSchema: {
+                source_id: z.number().int(),
+                count: z.number().int(),
+                results: z.array(memoryRowSchema.extend({
+                    relevance: z.number().nullable().optional()
+                }))
+            },
+            annotations: { readOnlyHint: true, openWorldHint: false }
+        }, this.handleFindSimilar);
+
+        R('tag_memory', {
+            title: 'Tag Memory',
+            description: 'Add and/or remove categories on a memory without rewriting its other metadata. Lighter than update_memory.',
+            inputSchema: {
+                id: z.number().int().positive(),
+                add: z.array(z.string()).optional(),
+                remove: z.array(z.string()).optional()
+            },
+            outputSchema: {
+                tagged: z.boolean(),
+                id: z.number().int(),
+                categories: z.array(z.string()).optional()
+            },
+            annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+        }, this.handleTagMemory);
 
         // --- MCP resources: each memory is addressable as durandal://memory/{id} ---
         // Using a ResourceTemplate so clients can list and discover memories
@@ -535,12 +630,18 @@ class DurandalMCPServer extends EventEmitter {
 
     // Stamp a `created_at`, default project/session, and enforce the 64 KB
     // serialized-metadata cap. Used by store_memory, store_memories_batch,
-    // update_memory. Extracted so the three call sites can't drift.
-    prepareStoredMetadata(metadata, fieldLabel = 'metadata') {
+    // update_memory, import_memories. Extracted so the call sites can't drift.
+    //
+    // `stampDefaults: false` skips the project/session defaults and the
+    // created_at re-stamp — used by import where we want to preserve the
+    // original metadata as-is from the backup.
+    prepareStoredMetadata(metadata, fieldLabel = 'metadata', stampDefaults = true) {
         const m = { ...(metadata || {}) };
-        if (!m.project) m.project = 'default';
-        if (!m.session) m.session = new Date().toISOString().split('T')[0];
-        m.created_at = new Date().toISOString();
+        if (stampDefaults) {
+            if (!m.project) m.project = 'default';
+            if (!m.session) m.session = new Date().toISOString().split('T')[0];
+            m.created_at = new Date().toISOString();
+        }
 
         let serialized;
         try {
@@ -608,11 +709,14 @@ class DurandalMCPServer extends EventEmitter {
         const { query, filters = {}, limit = 10 } = args;
 
         this.logger.substep('Querying database');
-        const dbResults = await this.db.searchMemories(query, {
-            project: filters.project,
-            session: filters.session,
-            limit: limit * 2 // over-fetch so post-filters trim without starving results
-        });
+        const [dbResults, total] = await Promise.all([
+            this.db.searchMemories(query, {
+                project: filters.project,
+                session: filters.session,
+                limit: limit * 2 // over-fetch so post-filters trim without starving results
+            }),
+            this.db.countSearchMatches(query, { project: filters.project, session: filters.session })
+        ]);
 
         const filtered = dbResults.filter((r) => {
             const m = r.metadata || {};
@@ -630,7 +734,10 @@ class DurandalMCPServer extends EventEmitter {
         });
 
         if (!filtered.length) {
-            return { content: [{ type: 'text', text: 'No memories found matching your query.' }] };
+            return {
+                content: [{ type: 'text', text: 'No memories found matching your query.' }],
+                structuredContent: { count: 0, total, results: [] }
+            };
         }
 
         // Results come back ranked by FTS BM25 when possible, so position i=0
@@ -653,10 +760,13 @@ class DurandalMCPServer extends EventEmitter {
                    `   Created: ${r.created_at || 'Unknown'}`;
         }).join('\n\n');
 
+        // Total = matches across the whole DB (so client can show "showing
+        // N of M" pagination). count = rows actually returned in this slice.
         return {
-            content: [{ type: 'text', text: `**Search Results** (${filtered.length} found)\n\n${formatted}` }],
+            content: [{ type: 'text', text: `**Search Results** (${filtered.length} of ${total} matches)\n\n${formatted}` }],
             structuredContent: {
                 count: filtered.length,
+                total,
                 results: filtered.map(r => ({
                     id: r.id,
                     content: r.content,
@@ -682,18 +792,11 @@ class DurandalMCPServer extends EventEmitter {
 
         let stats = null;
         if (includeStats) {
-            const rowCountRes = await this.db.db.query('SELECT COUNT(*) as count FROM memories')
-                .catch(() => ({ rows: [{ count: 0 }] }));
-            const projectCountRes = p
-                ? await this.db.db.query(
-                      "SELECT COUNT(*) as count FROM memories WHERE json_extract(metadata, '$.project') = ?",
-                      [p]
-                  ).catch(() => ({ rows: [{ count: 0 }] }))
-                : null;
+            const s = await this.db.stats({ project: p });
             stats = {
                 returned: memories.length,
-                totalMemoriesInDb: rowCountRes.rows[0]?.count || 0,
-                memoriesInProject: projectCountRes ? (projectCountRes.rows[0]?.count || 0) : null
+                totalMemoriesInDb: s.total,
+                memoriesInProject: p ? (s.inProject ?? 0) : null
             };
         }
 
@@ -729,7 +832,7 @@ class DurandalMCPServer extends EventEmitter {
         // Capture before/after DB size so the user can see what VACUUM actually
         // reclaimed. Prior versions printed "Cache optimization: Evicted 0 items"
         // with no connection to disk footprint.
-        const dbPath = this.db.db.dbPath;
+        const dbPath = this.db.dbPath;
         const sizeBefore = fs.existsSync(dbPath) ? fs.statSync(dbPath).size : 0;
 
         const results = [];
@@ -763,23 +866,20 @@ class DurandalMCPServer extends EventEmitter {
     }
 
     async runMaintenanceOperation(op) {
-        const client = this.db.db.client;
         switch (op) {
             case 'vacuum':
-                await new Promise((r, j) => client.exec('VACUUM', e => e ? j(e) : r()));
+                await this.db.exec('VACUUM');
                 return 'VACUUM completed (reclaimed fragmentation)';
             case 'analyze':
-                await new Promise((r, j) => client.exec('ANALYZE', e => e ? j(e) : r()));
+                await this.db.exec('ANALYZE');
                 return 'ANALYZE completed (query planner statistics refreshed)';
             case 'integrity_check': {
-                const rows = await new Promise((r, j) =>
-                    client.all('PRAGMA integrity_check', (e, x) => e ? j(e) : r(x)));
+                const rows = await this.db.integrityCheck();
                 const ok = rows.length === 1 && rows[0].integrity_check === 'ok';
                 return ok ? 'integrity_check: ok' : `integrity_check: ${rows.map(r => r.integrity_check).join('; ')}`;
             }
             case 'wal_checkpoint': {
-                const row = await new Promise((r, j) =>
-                    client.get('PRAGMA wal_checkpoint(TRUNCATE)', (e, x) => e ? j(e) : r(x)));
+                const row = await this.db.pragma('PRAGMA wal_checkpoint(TRUNCATE)');
                 return `wal_checkpoint: ${JSON.stringify(row)}`;
             }
             default:
@@ -789,26 +889,16 @@ class DurandalMCPServer extends EventEmitter {
 
     async handleGetStatus(args, requestId) {
         this.logger.processing('Processing get_status request from Claude');
-        const dbPath = this.db.db.dbPath;
+        const dbPath = this.db.dbPath;
         const dbExists = fs.existsSync(dbPath);
         const dbSize = dbExists ? (fs.statSync(dbPath).size / 1024 / 1024).toFixed(2) : '0.00';
 
         let dbMemoryCount = 0, dbProjectCount = 0, dbSessionCount = 0;
         if (dbExists) {
-            try {
-                const countResult = await this.db.db.query('SELECT COUNT(*) as count FROM memories');
-                dbMemoryCount = countResult.rows[0]?.count || 0;
-                const projectResult = await this.db.db.query(
-                    "SELECT COUNT(DISTINCT json_extract(metadata, '$.project')) as count FROM memories WHERE json_extract(metadata, '$.project') IS NOT NULL"
-                );
-                dbProjectCount = projectResult.rows[0]?.count || 0;
-                const sessionResult = await this.db.db.query(
-                    "SELECT COUNT(DISTINCT json_extract(metadata, '$.session')) as count FROM memories WHERE json_extract(metadata, '$.session') IS NOT NULL"
-                );
-                dbSessionCount = sessionResult.rows[0]?.count || 0;
-            } catch (e) {
-                this.logger.debug('Could not get memory counts:', e.message);
-            }
+            const s = await this.db.stats();
+            dbMemoryCount = s.total;
+            dbProjectCount = s.projects;
+            dbSessionCount = s.sessions;
         }
 
         const memUsage = process.memoryUsage();
@@ -827,7 +917,7 @@ class DurandalMCPServer extends EventEmitter {
                 memoryCount: dbMemoryCount,
                 projectCount: dbProjectCount,
                 sessionCount: dbSessionCount,
-                ftsEnabled: this.db.db.ftsAvailable === true
+                ftsEnabled: this.db.ftsAvailable
             },
             logging: {
                 consoleLevel: this.logger.getConsoleLevel(),
@@ -991,70 +1081,14 @@ class DurandalMCPServer extends EventEmitter {
         const includeSamples = args.include_samples || false;
         const limit = args.limit ?? 50;
 
+        // Iter 3: groupSummary batches samples via window function instead of
+        // firing one query per project/session (was N+1).
         const results = {};
         if (type === 'projects' || type === 'both') {
-            try {
-                const q = await this.db.db.query(`
-                    SELECT
-                        json_extract(metadata, '$.project') as project,
-                        COUNT(*) as count,
-                        MIN(created_at) as first_memory,
-                        MAX(created_at) as last_memory
-                    FROM memories
-                    WHERE json_extract(metadata, '$.project') IS NOT NULL
-                    GROUP BY json_extract(metadata, '$.project')
-                    ORDER BY count DESC
-                    LIMIT ?
-                `, [limit]);
-                results.projects = q.rows.map(r => ({
-                    name: r.project, memoryCount: r.count,
-                    firstMemory: r.first_memory, lastMemory: r.last_memory
-                }));
-                if (includeSamples) {
-                    for (const project of results.projects) {
-                        const s = await this.db.db.query(
-                            "SELECT content, created_at FROM memories WHERE json_extract(metadata, '$.project') = ? ORDER BY created_at DESC LIMIT 2",
-                            [project.name]
-                        );
-                        project.samples = s.rows;
-                    }
-                }
-            } catch (e) {
-                this.logger.error('Failed to list projects', { error: e.message });
-                results.projects = [];
-            }
+            results.projects = await this.db.groupSummary('project', { limit, includeSamples });
         }
         if (type === 'sessions' || type === 'both') {
-            try {
-                const q = await this.db.db.query(`
-                    SELECT
-                        json_extract(metadata, '$.session') as session,
-                        COUNT(*) as count,
-                        MIN(created_at) as first_memory,
-                        MAX(created_at) as last_memory
-                    FROM memories
-                    WHERE json_extract(metadata, '$.session') IS NOT NULL
-                    GROUP BY json_extract(metadata, '$.session')
-                    ORDER BY last_memory DESC
-                    LIMIT ?
-                `, [limit]);
-                results.sessions = q.rows.map(r => ({
-                    name: r.session, memoryCount: r.count,
-                    firstMemory: r.first_memory, lastMemory: r.last_memory
-                }));
-                if (includeSamples) {
-                    for (const session of results.sessions.slice(0, 10)) {
-                        const s = await this.db.db.query(
-                            "SELECT content, created_at FROM memories WHERE json_extract(metadata, '$.session') = ? ORDER BY created_at DESC LIMIT 2",
-                            [session.name]
-                        );
-                        session.samples = s.rows;
-                    }
-                }
-            } catch (e) {
-                this.logger.error('Failed to list sessions', { error: e.message });
-                results.sessions = [];
-            }
+            results.sessions = await this.db.groupSummary('session', { limit, includeSamples });
         }
 
         let output = '# Durandal Memory Organization\n\n';
@@ -1208,28 +1242,38 @@ class DurandalMCPServer extends EventEmitter {
 
     async handleListMemories(args, requestId) {
         this.logger.processing('Processing list_memories request');
-        const memories = await this.db.listMemories({
+        const filter = {
             project: args.project,
             session: args.session,
             since: args.since,
             until: args.until,
             limit: args.limit ?? 50,
             offset: args.offset ?? 0
-        });
-        this.logger.success(`Listed ${memories.length} memories`, { requestId });
+        };
+        const [memories, total] = await Promise.all([
+            this.db.listMemories(filter),
+            this.db.countList(filter)
+        ]);
+        this.logger.success(`Listed ${memories.length} of ${total} memories`, { requestId });
+
         const preview = memories.slice(0, 20).map((m, i) => {
             const c = m.content.length > 80 ? m.content.slice(0, 80) + '...' : m.content;
             return `${i + 1}. [${m.id}] ${c}`;
         }).join('\n');
+
+        const offset = args.offset ?? 0;
+        const limit = args.limit ?? 50;
+        const headerSuffix = offset ? `, offset ${offset}` : '';
         return {
             content: [{
                 type: 'text',
-                text: `**Memories** (${memories.length} shown${args.offset ? `, starting at offset ${args.offset}` : ''})\n\n${preview || '(none)'}`
+                text: `**Memories** (${memories.length} of ${total}${headerSuffix})\n\n${preview || '(none)'}`
             }],
             structuredContent: {
                 count: memories.length,
-                offset: args.offset ?? 0,
-                limit: args.limit ?? 50,
+                total,
+                offset,
+                limit,
                 memories
             }
         };
@@ -1244,28 +1288,58 @@ class DurandalMCPServer extends EventEmitter {
             count: memories.length,
             memories
         };
+
+        // Iter 3: don't inline the entire JSON dump in `text` — for a 50K-row
+        // database that ballooned the response to ~10 MB before the client
+        // even saw it. Text is a summary; structuredContent carries the data.
+        const summary = `**Exported ${memories.length} memories.**\n` +
+            `Total bytes (JSON): ~${JSON.stringify(payload).length}\n\n` +
+            `The full export is available in this response's structuredContent.memories.`;
+
         return {
-            content: [{
-                type: 'text',
-                text: `**Exported ${memories.length} memories.**\n\n\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``
-            }],
+            content: [{ type: 'text', text: summary }],
             structuredContent: payload
         };
     }
 
     async handleImportMemories(args, requestId) {
         this.logger.processing('Processing import_memories request');
-        const items = args.items.map(it => ({
-            content: it.content,
-            metadata: it.metadata || {}
-        }));
+
+        // Iter 3 hardening: import used to bypass every safeguard. Now each
+        // item runs through prepareStoredMetadata (size-cap + serialization
+        // safety) WITHOUT the defaulting/re-stamp — imports preserve original
+        // created_at and project/session from the backup payload.
+        // We also surface light type warnings without rejecting (imports are
+        // intentionally permissive so partial-quality backups can still load).
+        const warnings = [];
+        const items = args.items.map((it, i) => {
+            const meta = this.prepareStoredMetadata(it.metadata, `items[${i}].metadata`, false);
+            if (meta.importance !== undefined && (typeof meta.importance !== 'number' || meta.importance < 0 || meta.importance > 1)) {
+                warnings.push(`items[${i}].metadata.importance is not a number in [0,1] (got ${JSON.stringify(meta.importance)})`);
+            }
+            for (const f of ['categories', 'keywords']) {
+                if (meta[f] !== undefined && (!Array.isArray(meta[f]) || !meta[f].every(v => typeof v === 'string'))) {
+                    warnings.push(`items[${i}].metadata.${f} is not an array of strings`);
+                }
+            }
+            return { content: it.content, metadata: meta };
+        });
+
         const res = await this.db.storeMemoriesBatch(items);
         if (!res.success) {
             throw new DatabaseError('Import failed', 'import', new Error(res.error));
         }
+
+        let text = `[OK] Imported ${res.ids.length} memories.`;
+        if (warnings.length) {
+            text += `\n\n${warnings.length} item(s) had non-fatal validation warnings:\n` +
+                    warnings.slice(0, 10).map(w => `  - ${w}`).join('\n') +
+                    (warnings.length > 10 ? `\n  ... and ${warnings.length - 10} more` : '');
+        }
+
         return {
-            content: [{ type: 'text', text: `[OK] Imported ${res.ids.length} memories.` }],
-            structuredContent: { count: res.ids.length, ids: res.ids }
+            content: [{ type: 'text', text }],
+            structuredContent: { count: res.ids.length, ids: res.ids, warnings }
         };
     }
 
@@ -1304,6 +1378,65 @@ class DurandalMCPServer extends EventEmitter {
                 text: `[OK] Backup written to ${absPath}\nSize: ${(size / 1024).toFixed(1)} KB`
             }],
             structuredContent: { path: absPath, size }
+        };
+    }
+
+    async handleFindSimilar(args, requestId) {
+        this.logger.processing('Processing find_similar request');
+        const results = await this.db.findSimilar(args.id, { limit: args.limit ?? 5 });
+        if (results === null) {
+            return {
+                content: [{ type: 'text', text: `Source memory ${args.id} not found.` }],
+                structuredContent: { source_id: args.id, count: 0, results: [] }
+            };
+        }
+        const lines = results.map((r, i) => {
+            const c = r.content.length > 80 ? r.content.slice(0, 80) + '...' : r.content;
+            return `${i + 1}. [${r.id}] ${c}`;
+        }).join('\n');
+        return {
+            content: [{
+                type: 'text',
+                text: `**Memories similar to ${args.id}** (${results.length} found)\n\n${lines || '(none)'}`
+            }],
+            structuredContent: {
+                source_id: args.id,
+                count: results.length,
+                results: results.map(r => ({
+                    id: r.id,
+                    content: r.content,
+                    metadata: r.metadata,
+                    created_at: r.created_at,
+                    relevance: r.relevance ?? null
+                }))
+            }
+        };
+    }
+
+    async handleTagMemory(args, requestId) {
+        this.logger.processing('Processing tag_memory request');
+        if ((!args.add || !args.add.length) && (!args.remove || !args.remove.length)) {
+            throw new ValidationError(
+                'tag_memory requires at least one of `add` or `remove` to be a non-empty array',
+                'args', args
+            );
+        }
+        const res = await this.db.tagMemory(args.id, { add: args.add || [], remove: args.remove || [] });
+        if (!res.success) {
+            if (res.error === 'not_found') {
+                return {
+                    content: [{ type: 'text', text: `Memory ${args.id} not found.` }],
+                    structuredContent: { tagged: false, id: args.id }
+                };
+            }
+            throw new DatabaseError('tag_memory failed', 'tag', new Error(res.error));
+        }
+        return {
+            content: [{
+                type: 'text',
+                text: `[OK] Memory ${args.id} now has categories: ${res.categories.join(', ') || '(none)'}`
+            }],
+            structuredContent: { tagged: true, id: args.id, categories: res.categories }
         };
     }
 

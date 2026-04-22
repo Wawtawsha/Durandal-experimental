@@ -487,6 +487,89 @@ async function runSmoke() {
             failures.push('get_status did not report ftsEnabled=true');
         }
 
+        // 29. Iter 3: search_memories returns `total` for pagination
+        const totalProbe = await send('tools/call', {
+            name: 'search_memories',
+            arguments: { query: 'TypeScript', limit: 1 }
+        });
+        if (typeof totalProbe.result?.structuredContent?.total !== 'number') {
+            failures.push('search_memories missing total field in structuredContent');
+        }
+
+        // 30. Iter 3: list_memories returns `total` for pagination
+        const listTotal = await send('tools/call', {
+            name: 'list_memories',
+            arguments: { limit: 1 }
+        });
+        if (typeof listTotal.result?.structuredContent?.total !== 'number') {
+            failures.push('list_memories missing total field in structuredContent');
+        }
+
+        // 31. Iter 3: find_similar returns memories near a seed
+        // Store two related memories so find_similar has something to retrieve.
+        const seedProj = 'similar-' + Date.now();
+        const seed1 = await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'Apple bananas cherries date elderberry', metadata: { project: seedProj } }
+        });
+        await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'Apple cherries date kiwi', metadata: { project: seedProj } }
+        });
+        await send('tools/call', {
+            name: 'store_memory',
+            arguments: { content: 'completely unrelated warthog', metadata: { project: seedProj } }
+        });
+        const seedId = seed1.result?.structuredContent?.id;
+        if (typeof seedId === 'number') {
+            const sim = await send('tools/call', {
+                name: 'find_similar',
+                arguments: { id: seedId, limit: 5 }
+            });
+            const simSc = sim.result?.structuredContent;
+            if (!simSc || simSc.source_id !== seedId) {
+                failures.push('find_similar structuredContent missing source_id');
+            }
+            if (!simSc?.results?.length) {
+                failures.push('find_similar returned no results for an obvious near-duplicate');
+            }
+            if (simSc?.results?.some(r => r.id === seedId)) {
+                failures.push('find_similar included the source memory in its own results');
+            }
+        }
+
+        // 32. Iter 3: tag_memory adds and removes categories without rewriting metadata
+        const tagTarget = await send('tools/call', {
+            name: 'store_memory',
+            arguments: {
+                content: 'tag-target-' + Date.now(),
+                metadata: { project: 'tagtest', importance: 0.5, categories: ['original'] }
+            }
+        });
+        const tagTargetId = tagTarget.result?.structuredContent?.id;
+        const addTags = await send('tools/call', {
+            name: 'tag_memory',
+            arguments: { id: tagTargetId, add: ['extra1', 'extra2'] }
+        });
+        const tagSc = addTags.result?.structuredContent;
+        if (!tagSc?.tagged || !tagSc.categories?.includes('extra1') || !tagSc.categories?.includes('original')) {
+            failures.push('tag_memory add did not preserve original + add new tags');
+        }
+        // Verify importance survived (tag_memory must not clobber other metadata)
+        const afterTag = await send('tools/call', { name: 'get_memory', arguments: { id: tagTargetId } });
+        const afterMeta = afterTag.result?.structuredContent?.memory?.metadata;
+        if (afterMeta?.importance !== 0.5) {
+            failures.push('tag_memory clobbered unrelated metadata.importance');
+        }
+        // Empty add+remove rejected
+        const noOp = await send('tools/call', {
+            name: 'tag_memory',
+            arguments: { id: tagTargetId }
+        });
+        if (noOp.result?.isError !== true) {
+            failures.push('tag_memory should reject calls with no add/remove');
+        }
+
     } catch (err) {
         failures.push(`Exception: ${err.message}`);
     } finally {

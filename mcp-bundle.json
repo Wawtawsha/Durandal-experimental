@@ -37,7 +37,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.5",
-    "sqlite3": "^5.1.6"
+    "sqlite3": "^6.0.1"
   },
   "files": [
     "durandal-mcp-server-v3.js",

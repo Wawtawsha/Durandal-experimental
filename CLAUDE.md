@@ -73,6 +73,12 @@ and vector indexes can't return stale/superseded rows.
   `db.transaction(...)` callback. Compute embeddings before the transaction.
 - **Verbatim storage.** No LLM in the write path; consolidation is near-duplicate
   detection only and is reversible (superseded rows are retained).
+- **Consolidation truncation guard.** Embeddings truncate long text (~256 tokens),
+  so auto-supersede trusts cosine only for content under ~512 chars; longer content
+  requires exact text. Do NOT remove this guard — it prevents two different long
+  memories that share a prefix from falsely consolidating (hiding data).
+- **IMMEDIATE transactions for read-modify-write.** store/update/tag/delete-where
+  use `tx.immediate()` so concurrent writers can't lose updates.
 
 ## Testing
 

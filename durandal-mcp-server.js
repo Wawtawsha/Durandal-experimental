@@ -350,9 +350,9 @@ class DurandalMCPServer extends EventEmitter {
 
         R('optimize_memory', {
             title: 'Optimize Memory',
-            description: 'Run SQLite maintenance: VACUUM, ANALYZE, integrity check, WAL checkpoint.',
+            description: 'Run SQLite maintenance and/or backfill embeddings. Operations: vacuum, analyze, integrity_check, wal_checkpoint, backfill_embeddings (embed any memories that lack a vector — e.g. after upgrading a pre-v4 database to enable semantic search over old memories).',
             inputSchema: {
-                operations: z.array(z.enum(['vacuum', 'analyze', 'integrity_check', 'wal_checkpoint']))
+                operations: z.array(z.enum(['vacuum', 'analyze', 'integrity_check', 'wal_checkpoint', 'backfill_embeddings']))
                     .optional()
                     .default(['vacuum', 'analyze'])
             },
@@ -908,6 +908,11 @@ class DurandalMCPServer extends EventEmitter {
             case 'wal_checkpoint': {
                 const row = await this.db.pragma('PRAGMA wal_checkpoint(TRUNCATE)');
                 return `wal_checkpoint: ${JSON.stringify(row)}`;
+            }
+            case 'backfill_embeddings': {
+                const r = await this.db.backfillEmbeddings();
+                if (!r.available) return 'backfill_embeddings: skipped (embeddings unavailable)';
+                return `backfill_embeddings: embedded ${r.embedded} of ${r.missing} memories that lacked vectors`;
             }
             default:
                 throw new ValidationError(`Unknown maintenance operation: ${op}`, 'operation', op);

@@ -156,7 +156,11 @@ lexical only. **The server is never worse than a pure FTS5/BM25 store.**
 Consolidation is conservative and **reversible** — superseded rows are retained
 (fetchable by id, restored if their superseder is deleted) and the action is
 always reported. It exists to stop near-duplicate / restated facts from piling
-up, not to make irreversible judgements. Contradiction detection beyond near-
+up, not to make irreversible judgements. Because the embedding model truncates
+long text (~256 tokens), two long memories sharing a prefix can embed nearly
+identically; to avoid hiding genuinely different content, auto-consolidation
+trusts cosine only for content under ~512 characters and otherwise requires
+normalized-exact text equality. Contradiction detection beyond near-
 duplication is intentionally out of scope (it would require an LLM in the write
 path; see "Not in scope").
 
@@ -269,6 +273,24 @@ legacy/                  pre-v4 app + the removed RAMR cache — not in the npm 
 Requires Node ≥ 20 (better-sqlite3 prebuilt binaries).
 
 ---
+
+## Known limitations
+
+- **Embedding truncation.** all-MiniLM-L6-v2 encodes only the first ~256 tokens,
+  so semantic recall of long memories is biased toward their opening; lexical
+  (FTS) still matches the full text. Auto-consolidation guards against the
+  truncation false-positive (see Writes), but semantic *ranking* of long
+  documents is prefix-weighted.
+- **export/import is logical, not byte-exact.** `export_memories` emits active
+  rows only; re-importing into a populated database does not re-run consolidation
+  and can create duplicates. For a faithful, full-state snapshot use
+  `backup_database` (VACUUM INTO).
+- **`total` is "lexical matches, or the number returned, whichever is larger."**
+  Semantic-only neighbours can appear beyond the lexical match count; `count`
+  never exceeds `total`, but `total` is not a precise whole-database semantic count.
+- **Concurrency.** Read-modify-write operations (store/update/tag/bulk-delete)
+  use IMMEDIATE transactions so concurrent writers serialize. Multiple processes
+  sharing one DB file rely on SQLite/WAL locking (`busy_timeout` 5 s).
 
 ## Not in scope
 

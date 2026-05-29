@@ -78,8 +78,10 @@ class TestRunner {
         await this.runTest('Lexical search (exact tokens)', this.testLexical.bind(this));
         await this.runTest('Semantic recall (paraphrase)', this.testSemantic.bind(this));
         await this.runTest('Consolidation supersedes near-duplicate', this.testConsolidation.bind(this));
+        await this.runTest('Consolidation guards against embedding truncation', this.testTruncationGuard.bind(this));
         await this.runTest('Semantic recall is project-scoped', this.testSemanticScoped.bind(this));
         await this.runTest('Filters applied in SQL + filter-aware total', this.testFilters.bind(this));
+        await this.runTest('count never exceeds total', this.testCountTotal.bind(this));
         await this.runTest('find_similar', this.testFindSimilar.bind(this));
         await this.runTest('suggest_consolidations (client-driven)', this.testSuggestConsolidations.bind(this));
         await this.runTest('Graceful degradation (embeddings off)', this.testDegradation.bind(this));
@@ -228,6 +230,22 @@ class TestRunner {
         this.assert(this.db.stats().superseded >= 1, 'stats.superseded should count it');
     }
 
+    async testTruncationGuard() {
+        if (!this.semantic) return { skipped: true, reason: '(needs embeddings)' };
+        const proj = 'trunc' + Date.now();
+        // A long shared preamble (well over the embedding's ~256-token window)
+        // makes two memories embed to ~identical vectors even though their tails
+        // state OPPOSITE decisions. The length/exact guard must stop the second
+        // from superseding (and hiding) the first.
+        const preamble = 'Sprint planning meeting notes for the platform team. '.repeat(80);
+        const a = preamble + ' DECISION: we will SHIP feature X on Monday.';
+        const b = preamble + ' DECISION: we will CANCEL feature X entirely.';
+        const ra = await this.db.storeMemory(a, { project: proj });
+        const rb = await this.db.storeMemory(b, { project: proj });
+        this.assert(rb.supersededId !== ra.id, 'long memory with a different tail was falsely consolidated (data hidden!)');
+        this.assert(this.db.getMemoryById(ra.id).superseded_by === null, 'first long memory was wrongly superseded');
+    }
+
     async testSemanticScoped() {
         if (!this.semantic) return { skipped: true, reason: '(needs embeddings)' };
         // Regression guard for project-filtered vector KNN: a target in one project
@@ -264,6 +282,18 @@ class TestRunner {
         // Category filter.
         const cat = await this.db.searchMemories(tag, { project: 'fltA', categories: ['y'] });
         this.assert(cat.results.length === 1 && cat.results[0].content.includes('low one'), 'category filter wrong');
+    }
+
+    async testCountTotal() {
+        if (!this.semantic) return { skipped: true, reason: '(needs embeddings)' };
+        const proj = 'ct' + Date.now();
+        // The second memory shares no tokens with the query "elephant" — it's a
+        // semantic-only hit that inflates results beyond the lexical total.
+        // count must never exceed total.
+        await this.db.storeMemory('the elephant is a large grey mammal', { project: proj });
+        await this.db.storeMemory('a huge pachyderm with tusks and a trunk', { project: proj });
+        const { results, total } = await this.db.searchMemories('elephant', { project: proj });
+        this.assert(results.length <= total, `count (${results.length}) must not exceed total (${total})`);
     }
 
     async testFindSimilar() {

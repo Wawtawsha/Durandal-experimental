@@ -30,7 +30,8 @@
   "scripts": {
     "start": "node durandal-mcp-server.js",
     "test": "node durandal-mcp-server.js --test",
-    "test:smoke": "node test-mcp-smoke.js"
+    "test:smoke": "node test-mcp-smoke.js",
+    "test:adversarial": "node test-adversarial.js"
   },
   "keywords": [
     "mcp",

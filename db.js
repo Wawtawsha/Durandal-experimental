@@ -41,6 +41,12 @@ const RRF_K = Number(process.env.DURANDAL_RRF_K) || 60;
 // "essentially restating the same thing." Deliberately conservative — superseding
 // is reversible (nothing is deleted) but should still only fire on clear restatements.
 const NEAR_DUP_DISTANCE = Number(process.env.DURANDAL_DEDUP_DISTANCE) || 0.08;
+// Embeddings truncate long text (~256 tokens), so cosine can rate two long
+// memories that share a prefix as identical even when their tails differ — which
+// would falsely consolidate (and HIDE) genuinely different content. Trust cosine
+// for auto-consolidation only up to this content length; beyond it, require
+// normalized-exact text equality before superseding.
+const SAFE_DEDUP_CHARS = Number(process.env.DURANDAL_SAFE_DEDUP_CHARS) || 512;
 // Minimum cosine similarity for a semantic (vector) hit to count as a real match
 // during search. Vector KNN always returns *a* nearest neighbour, so without a
 // floor a small store would return everything ranked. 0.35 keeps genuine
@@ -60,6 +66,9 @@ const toBlob = (f32) => Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength);
 
 // Escape LIKE wildcards so user queries can't widen the match (ESCAPE '\' in SQL).
 const escapeLike = (s) => String(s).replace(/[\\%_]/g, '\\$&');
+
+// Normalize text for exact-duplicate comparison (case- and whitespace-insensitive).
+const norm = (s) => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
 
 // Tokenize a user query for FTS5 MATCH: split on non-word runs, quote each token,
 // AND-join. Returns null if nothing tokenizable remains (caller falls back).
@@ -326,14 +335,16 @@ class MemoryDB {
                     // Consolidation: supersede the nearest active same-project memory
                     // if it's a near-duplicate. Reversible — we only set a flag.
                     const near = this._nearestActive(embedding, project, id);
-                    if (near && near.distance <= NEAR_DUP_DISTANCE) {
+                    if (near && near.distance <= NEAR_DUP_DISTANCE && this._confirmDuplicate(content, near.id)) {
                         this.db.prepare('UPDATE memories SET superseded_by = ? WHERE id = ?').run(id, near.id);
                         supersededId = near.id;
                     }
                 }
                 return id;
             });
-            const id = tx();
+            // IMMEDIATE: acquire the write lock up front so two concurrent stores
+            // can't both pick the same near-duplicate to supersede.
+            const id = tx.immediate();
             return { success: true, id, supersededId };
         } catch (error) {
             return { success: false, error: error.message };
@@ -357,6 +368,19 @@ class MemoryDB {
             if (active) return { id: mid, distance: r.distance };
         }
         return null;
+    }
+
+    // Confirm two memories are genuinely duplicates before auto-superseding.
+    // Embedding truncation can make long, differently-tailed content look
+    // identical by cosine, so trust cosine only when BOTH contents are short
+    // enough to be fully embedded; for longer content require exact text.
+    _confirmDuplicate(newContent, oldId) {
+        const old = this.db.prepare('SELECT content FROM memories WHERE id = ?').get(oldId);
+        if (!old) return false;
+        if (newContent.length <= SAFE_DEDUP_CHARS && old.content.length <= SAFE_DEDUP_CHARS) {
+            return true;
+        }
+        return norm(newContent) === norm(old.content);
     }
 
     // Bulk insert in one transaction. Embeds the whole batch up front. Skips
@@ -415,7 +439,7 @@ class MemoryDB {
                     try { this.db.prepare('UPDATE vec_memories SET project = ? WHERE memory_id = ?').run(newProject, BigInt(id)); } catch (_) {}
                 }
             });
-            tx();
+            tx.immediate();
             return { success: true };
         } catch (error) {
             return { success: false, error: error.message };
@@ -437,7 +461,7 @@ class MemoryDB {
                 importance_min: opts.importance_min, importance_max: opts.importance_max
             };
 
-            const total = this._countMatches(query, filters);
+            const lexicalTotal = this._countMatches(query, filters);
 
             const ftsRows = this.ftsAvailable ? this._ftsSearch(query, filters, POOL) : null;
             let vecHits = [];
@@ -453,7 +477,7 @@ class MemoryDB {
             // query with no embeddings).
             if ((!ftsRows || !ftsRows.length) && !vecHits.length) {
                 const like = this._likeSearch(query, filters, limit);
-                return { results: like, total: total || like.length };
+                return { results: like, total: Math.max(lexicalTotal, like.length) };
             }
 
             const ftsIds = (ftsRows || []).map(r => r.id);
@@ -487,11 +511,14 @@ class MemoryDB {
             // Break near-equal fused scores by importance, then recency.
             ranked.sort((a, b) => {
                 if (Math.abs(a.relevance - b.relevance) > TIE_EPSILON) return b.relevance - a.relevance;
-                const ia = a.metadata?.importance ?? 0, ib = b.metadata?.importance ?? 0;
+                const ia = Number(a.metadata?.importance) || 0, ib = Number(b.metadata?.importance) || 0;
                 if (ia !== ib) return ib - ia;
                 return String(b.created_at).localeCompare(String(a.created_at));
             });
 
+            // total >= returned count and >= lexical matches, so count <= total
+            // always holds even when semantic neighbours add to the result set.
+            const total = Math.max(lexicalTotal, ranked.length);
             return { results: ranked.slice(0, limit), total };
         } catch (error) {
             // Distinguish failure from "no matches": throw so the handler reports
@@ -783,7 +810,7 @@ class MemoryDB {
                 }
                 return this.db.prepare(`DELETE FROM memories WHERE id IN (${ph})`).run(...ids).changes;
             });
-            return { success: true, deleted: tx() };
+            return { success: true, deleted: tx.immediate() };
         } catch (error) {
             return { success: false, error: error.message };
         }
@@ -791,16 +818,23 @@ class MemoryDB {
 
     tagMemory(id, { add = [], remove = [] } = {}) {
         try {
-            const existing = this.getMemoryById(id);
-            if (!existing) return { success: false, error: 'not_found' };
-            const meta = { ...(existing.metadata || {}) };
-            const current = new Set(Array.isArray(meta.categories) ? meta.categories : []);
-            for (const t of add) current.add(t);
-            for (const t of remove) current.delete(t);
-            meta.categories = [...current];
-            this.db.prepare('UPDATE memories SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-                .run(JSON.stringify(meta), id);
-            return { success: true, categories: meta.categories };
+            // Read + write inside one IMMEDIATE transaction so concurrent taggers
+            // can't clobber each other's category edits (lost update).
+            const tx = this.db.transaction(() => {
+                const existing = this.getMemoryById(id);
+                if (!existing) return null;
+                const meta = { ...(existing.metadata || {}) };
+                const current = new Set(Array.isArray(meta.categories) ? meta.categories : []);
+                for (const t of add) current.add(t);
+                for (const t of remove) current.delete(t);
+                meta.categories = [...current];
+                this.db.prepare('UPDATE memories SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+                    .run(JSON.stringify(meta), id);
+                return meta.categories;
+            });
+            const categories = tx.immediate();
+            if (categories === null) return { success: false, error: 'not_found' };
+            return { success: true, categories };
         } catch (error) {
             return { success: false, error: error.message };
         }

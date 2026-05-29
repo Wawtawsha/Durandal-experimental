@@ -1,7 +1,7 @@
 {
   "name": "durandal-memory",
-  "version": "3.2.5",
-  "description": "Durandal Memory MCP Server - zero-config AI memory system for Claude Code. Provides persistent memory, search, and context management over SQLite.",
+  "version": "4.0.0",
+  "description": "Durandal Memory MCP Server - zero-config, local-only AI memory for Claude Code. Hybrid lexical (FTS5/BM25) + semantic (local embeddings + sqlite-vec) search with write-time consolidation.",
   "author": "Enterprise Data and Analytics",
   "license": "MIT",
   "keywords": [
@@ -10,12 +10,15 @@
     "claude",
     "mcp",
     "persistent",
-    "context"
+    "context",
+    "semantic-search",
+    "hybrid-search",
+    "embeddings"
   ],
   "mcpVersion": "1.0.0",
   "server": {
     "command": "node",
-    "args": ["durandal-mcp-server-v3.js"],
+    "args": ["durandal-mcp-server.js"],
     "env": {}
   },
   "capabilities": {
@@ -24,29 +27,44 @@
       "search_memories",
       "get_context",
       "get_memory",
+      "update_memory",
       "delete_memory",
+      "list_memories",
+      "store_memories_batch",
+      "export_memories",
+      "import_memories",
+      "rename_project",
+      "delete_memories_where",
+      "find_similar",
+      "list_projects_sessions",
+      "tag_memory",
       "optimize_memory",
+      "backup_database",
       "get_status",
       "configure_logging",
-      "get_logs",
-      "list_projects_sessions"
+      "get_logs"
     ]
   },
   "requirements": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.5",
-    "sqlite3": "^6.0.1"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "12.10.0",
+    "sqlite-vec": "0.1.9",
+    "@huggingface/transformers": "^4.2.0"
   },
   "files": [
-    "durandal-mcp-server-v3.js",
-    "db-adapter.js",
-    "mcp-db-client.js",
+    "durandal-mcp-server.js",
+    "db.js",
+    "embeddings.js",
     "logger.js",
     "errors.js",
     "test-runner.js",
     "update-checker.js",
+    "db-discovery.js",
+    "db-migrate.js",
+    "assign-projects.js",
     "package.json",
     ".env.mcp-minimal"
   ],
@@ -61,6 +79,10 @@
     "required": [],
     "optional": [
       { "name": "DATABASE_PATH", "description": "SQLite database path", "default": "~/.durandal-mcp/durandal-mcp-memory.db" },
+      { "name": "DURANDAL_EMBEDDINGS", "description": "Set false to force lexical-only (no embedding model)", "default": "true" },
+      { "name": "DURANDAL_EMBED_MODEL", "description": "transformers.js feature-extraction model id", "default": "Xenova/all-MiniLM-L6-v2" },
+      { "name": "DURANDAL_SEMANTIC_MIN_SIM", "description": "Minimum cosine similarity for a semantic match", "default": "0.35" },
+      { "name": "DURANDAL_DEDUP_DISTANCE", "description": "Max cosine distance to consolidate a near-duplicate", "default": "0.08" },
       { "name": "CONSOLE_LOG_LEVEL", "description": "Console log level (error|warn|info|debug)", "default": "warn" },
       { "name": "FILE_LOG_LEVEL", "description": "File log level (error|warn|info|debug)", "default": "info" }
     ]

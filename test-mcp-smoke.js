@@ -3,7 +3,7 @@
 /**
  * End-to-end MCP stdio smoke test.
  *
- * Spawns durandal-mcp-server-v3.js as a subprocess and speaks raw JSON-RPC
+ * Spawns durandal-mcp-server.js as a subprocess and speaks raw JSON-RPC
  * over stdin/stdout to verify the server:
  *   1. Doesn't corrupt stdout with non-protocol text (logs, banners, etc.)
  *   2. Returns a valid initialize response
@@ -39,7 +39,7 @@ function parseLines(buffer) {
 
 async function runSmoke() {
     const dbPath = makeTempDbPath();
-    const serverPath = path.join(__dirname, 'durandal-mcp-server-v3.js');
+    const serverPath = path.join(__dirname, 'durandal-mcp-server.js');
 
     const child = spawn(process.execPath, [serverPath], {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -250,11 +250,14 @@ async function runSmoke() {
             arguments: { query: '100%', filters: { project: 'esc' } }
         });
         const escResults = escResp.result?.structuredContent?.results || [];
-        if (!escResults.some(r => r.content.includes('100% complete'))) {
+        const pctRow = escResults.find(r => r.content.includes('100% complete'));
+        if (!pctRow) {
             failures.push('search_memories did not return the "100% complete" entry');
         }
-        if (escResults.some(r => r.content.includes('progress is ongoing'))) {
-            failures.push('search_memories for "100%" matched an entry without a "%" in content');
+        // The "%" must be treated as a literal token (FTS tokenizes to "100"),
+        // NOT a LIKE wildcard — so the 100% row matches on the lexical signal.
+        if (pctRow && !(pctRow.signals || []).includes('lexical')) {
+            failures.push('search for "100%" did not match the 100% row lexically (wildcard escaping issue)');
         }
 
         // 14. Phase 4: get_memory and delete_memory round-trip.
@@ -315,10 +318,12 @@ async function runSmoke() {
         });
         const ftsResults = ftsResp.result?.structuredContent?.results || [];
         if (!ftsResults.some(r => r.content.includes('React with TypeScript'))) {
-            failures.push('FTS search did not return the react+typescript row');
+            failures.push('hybrid search did not return the react+typescript row');
         }
-        if (ftsResults.some(r => r.content.includes('backend is also nice'))) {
-            failures.push('FTS search for "react typescript" incorrectly returned backend-only row (tokenized AND not enforced)');
+        // Under hybrid search the TypeScript-only row may appear as a weaker
+        // related result, but the row matching BOTH tokens must rank first.
+        if (ftsResults.length && !ftsResults[0].content.includes('React with TypeScript')) {
+            failures.push('hybrid search did not rank the react+typescript row first');
         }
 
         // 17. Phase 5: FTS results carry a relevance score and a snippet.

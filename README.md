@@ -1,12 +1,18 @@
 # Durandal Memory MCP Server
 
-[![NPM Version](https://img.shields.io/npm/v/durandal-memory-mcp.svg)](https://npmjs.org/package/durandal-memory-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Node Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
+[![Node Version](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org/)
 
-**Zero-config AI memory system for Claude Code via Model Context Protocol (MCP)**
+**Zero-config, local-only AI memory for Claude Code — with hybrid lexical +
+semantic search.**
 
-Give Claude Code persistent memory that remembers across sessions. Store information, search memories, and maintain context automatically.
+Give Claude Code persistent memory across sessions. Store things, then find them
+again whether you remember the exact words or not. Searching *"compilation
+failing"* will surface a memory that says *"the build is broken"* — semantic
+recall that plain keyword search can't do — while exact tokens (error codes,
+file paths, identifiers) still match precisely.
+
+Everything runs on your machine. **No API keys. No cloud. No per-use cost.**
 
 ## Quick Start
 
@@ -17,188 +23,124 @@ npm install -g durandal-memory-mcp
 
 ### 2. Add to Claude Code
 ```bash
-# For Windows
+# Windows
 claude mcp add durandal-memory -- cmd /c durandal-mcp
-
-# For macOS/Linux
+# macOS/Linux
 claude mcp add durandal-memory -- durandal-mcp
 ```
 
-### 3. Verify Setup
+### 3. Verify
 ```bash
-claude mcp list
-# Should show: durandal-memory: ... - Connected
+claude mcp list   # should show: durandal-memory: ... - Connected
 ```
 
-**That's it!** No configuration files, no API keys, no database setup required.
+That's it. On first use the server creates its SQLite database and downloads a
+small (~23 MB) embedding model once; after that it works fully offline.
 
-## How to Use
+> Requires **Node.js ≥ 20**.
 
-Just talk naturally to Claude Code. The memory system activates automatically:
+## How it works
 
-### Store Memories
-- *"Remember that I prefer React with TypeScript"*
-- *"Store this API endpoint for later: https://api.example.com"*
-- *"I need you to remember my coding style preferences"*
+- **Hybrid retrieval.** Every search runs two engines and fuses them with
+  Reciprocal Rank Fusion: SQLite **FTS5/BM25** for exact lexical matches, and a
+  local **embedding model** (`all-MiniLM-L6-v2`) with **sqlite-vec** cosine
+  search for meaning. You get exact-token precision *and* paraphrase recall.
+- **Write-time consolidation.** Storing a near-duplicate of an existing memory
+  marks the older one *superseded* — hidden from results, never deleted, and
+  reported back — so restated facts don't pile up.
+- **Graceful by design.** If the embedding model can't load (e.g. offline on the
+  very first run), the server automatically falls back to lexical-only search.
+  It is never worse than a plain full-text store.
+- **Local & private.** All data and the model stay on your machine.
 
-### Retrieve Memories
-- *"What do you remember about my preferences?"*
-- *"Search my memories for React"*
-- *"Do you recall anything about TypeScript?"*
+## How to use
 
-### Get Context
-- *"What context do you have about this project?"*
-- *"Show me recent memories"*
-- *"What's in my memory system?"*
+Just talk to Claude Code naturally — it calls the tools for you:
 
-### Optimize Memory
-- *"Optimize my memories"*
-- *"Clean up memory storage"*
+- *"Remember that I prefer React with TypeScript."*
+- *"What do you remember about my deployment setup?"*
+- *"Did we hit a database error last week? Search my memories."*
+- *"What context do you have on this project?"*
 
-## Features
+## MCP Tools
 
-- **Persistent memory** across Claude Code sessions.
-- **Full-text search** (SQLite FTS5) with BM25 relevance ranking and
-  snippet highlighting — `"react typescript"` correctly matches rows with
-  both tokens.
-- **Zero configuration** — SQLite database is created automatically at
-  `~/.durandal-mcp/durandal-mcp-memory.db` on first use.
-- **Structured tool responses** — every tool returns `structuredContent`
-  alongside text for typed clients.
-- **MCP resources and prompts** — memories are also addressable via
-  `durandal://memory/{id}` and come with a ready-made summarization prompt.
-- **Safe by default** — bulk deletes require a filter, metadata is size-
-  capped and type-checked, one corrupt row can't wipe your result set.
-- **Local-only** — all data stays on your machine.
+**Core:** `store_memory`, `search_memories` (hybrid), `get_context`,
+`get_memory`, `update_memory`, `delete_memory`, `list_memories`
 
-## MCP Tools Available
+**Bulk:** `store_memories_batch`, `export_memories`, `import_memories`,
+`rename_project`, `delete_memories_where`
 
-The server exposes the following tools to Claude Code:
+**Discovery:** `find_similar` (semantic), `list_projects_sessions`, `tag_memory`
 
-**Core memory operations**
-- `store_memory(content, metadata?)` — store a memory; returns the new id.
-- `get_memory(id)` — fetch one memory by id.
-- `update_memory(id, content?, metadata?)` — edit an existing memory.
-- `delete_memory(id)` — delete one memory.
-- `search_memories(query, filters?, limit?)` — full-text search with BM25
-  relevance ranking (tokenized AND-match; `"react typescript"` requires both).
-- `get_context(project?, session?, limit?, include_stats?)` — recent memories
-  scoped to a project/session.
-- `list_memories(project?, session?, since?, until?, limit, offset)` —
-  paginated browse without a search query.
+**Admin:** `optimize_memory` (vacuum/analyze/integrity_check/wal_checkpoint/
+backfill_embeddings), `backup_database`, `get_status`, `configure_logging`,
+`get_logs`
 
-**Bulk operations**
-- `store_memories_batch(items)` — transactional bulk insert.
-- `export_memories()` — dump all memories as JSON for backup.
-- `import_memories(items)` — insert memories from a JSON array.
-- `rename_project(from, to)` — rename a project across all rows.
-- `delete_memories_where(project?, session?, older_than?)` — bulk delete
-  (requires at least one filter).
+Memories are also addressable as the MCP resource `durandal://memory/{id}`, and a
+`summarize_recent_memories` prompt is provided.
 
-**Maintenance and admin**
-- `optimize_memory(operations)` — run SQLite maintenance
-  (`vacuum`, `analyze`, `integrity_check`, `wal_checkpoint`).
-- `backup_database(destination)` — atomic snapshot via `VACUUM INTO`.
-- `get_status()` — server status, database stats, FTS availability.
-- `list_projects_sessions(type?, include_samples?, limit?)` — summary of
-  distinct projects and sessions.
-- `configure_logging(console_level?, file_level?)` — runtime log level.
-- `get_logs(lines?, level_filter?, search?)` — recent log entries.
+## Configuration (all optional)
 
-**MCP resources and prompts**
-- Resource template `durandal://memory/{id}` — URI-addressable memories.
-- Prompt `summarize_recent_memories(project?, limit?)` — ready-made prompt
-  that embeds recent memories for Claude to summarize.
-
-## File Structure
-
-After installation, the server creates:
-- `durandal-mcp-memory.db` - SQLite database (auto-created)
-- `~/.durandal-mcp/logs/` - Session history logs (auto-created)
-- Memory data organized by:
-  - Content and metadata
-  - Categories and keywords
-  - Importance scores
-  - Timestamps
-
-## Configuration (Optional)
-
-The system works with zero configuration, but you can customize:
+The server is zero-config. To customise, set environment variables:
 
 ```bash
-# Copy the minimal config template
-cp node_modules/durandal-memory-mcp/.env.mcp-minimal .env
-
-# Edit if needed (all settings are optional):
-DATABASE_PATH=./my-custom-memory.db
-CONSOLE_LOG_LEVEL=warn  # Terminal output: error, warn, info, debug
-FILE_LOG_LEVEL=info     # Log file detail: error, warn, info, debug
+DATABASE_PATH=./my-memory.db          # database location
+DURANDAL_EMBEDDINGS=false             # force lexical-only (skip the model)
+DURANDAL_EMBED_MODEL=Xenova/bge-small-en-v1.5   # swap the embedding model
+DURANDAL_SEMANTIC_MIN_SIM=0.35        # min similarity for a semantic match
+DURANDAL_DEDUP_DISTANCE=0.08          # near-duplicate consolidation threshold
+CONSOLE_LOG_LEVEL=warn                # error | warn | info | debug
 ```
 
-## Advanced Usage
+See `.env.mcp-minimal` for the full list.
 
-### Check Server Status
+## CLI
+
 ```bash
+durandal-mcp --status     # health, database stats, semantic-search status
+durandal-mcp --test       # run the built-in test suite
+durandal-mcp --version
 durandal-mcp --help
 ```
 
-### Run Standalone Test
-```bash
-durandal-mcp --test
-```
+## Upgrading from v3
 
-### Configure Logging Levels
-```bash
-durandal-mcp --configure
-```
+v4 reads a v3 database in place — the schema is migrated non-destructively on
+first open (new columns added, FTS rebuilt if needed). Your existing memories
+keep working immediately with lexical search. To add semantic search over them,
+run the `backfill_embeddings` operation once:
 
-### Different Working Directory
-The MCP server creates its database in the current working directory where Claude Code is running.
+> *"Optimize my memory and backfill embeddings."*
+
+(or call `optimize_memory` with the `backfill_embeddings` operation). New
+memories are embedded automatically.
 
 ## Troubleshooting
 
-### MCP Server Not Connecting
-```bash
-# Check if server is configured
-claude mcp list
+**Not connecting?** `claude mcp remove durandal-memory` then re-add; check
+`claude mcp list`.
 
-# Remove and re-add if needed
-claude mcp remove durandal-memory
-claude mcp add durandal-memory -- cmd /c durandal-mcp
-```
+**Semantic search shows as OFF in `--status`?** The embedding model couldn't
+load (often no network on first run, or a blocked download). The server still
+works with lexical search; it will retry the model on the next start. Force
+lexical-only permanently with `DURANDAL_EMBEDDINGS=false`.
 
-### Database Issues
-```bash
-# The database is auto-created, but if you have permission issues:
-# Make sure the directory is writable
-# Delete the .db file to recreate: rm durandal-mcp-memory.db
-```
-
-### Memory Not Working
-- Make sure you're using natural language (not technical commands)
-- Try: *"Remember this:"* followed by your content
-- Check that Claude Code shows the MCP server as connected
-
-### Debugging Issues
-- Session logs are stored at: `~/.durandal-mcp/logs/durandal-YYYY-MM-DD.log`
-- Send log files to support for assistance
-- Use `get_logs` MCP tool to retrieve recent entries
-- Configure log levels with `configure_logging` MCP tool
+**Logs:** `~/.durandal-mcp/logs/durandal-YYYY-MM-DD.log`, or the `get_logs` tool.
 
 ## Requirements
 
-- **Node.js**: 18.0.0 or higher
-- **Claude Code**: Latest version
-- **Operating System**: Windows, macOS, or Linux
+- Node.js ≥ 20
+- Claude Code (latest)
+- Windows, macOS, or Linux (x64; the vector extension ships x64 binaries)
 
 ## Support
 
-- **Issues/Feedback**: stephen.leonard@entdna.com
+- Issues/Feedback: stephen.leonard@entdna.com
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).
 
 ---
 
-**Zero-config persistent memory for Claude Code**
+**Zero-config, local, hybrid-search memory for Claude Code.**

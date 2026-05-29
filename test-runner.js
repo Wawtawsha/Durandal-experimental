@@ -1,17 +1,37 @@
 /**
- * Durandal MCP Server - Test Runner
+ * Durandal MCP Server — built-in test suite (`durandal-mcp --test`).
  *
- * Comprehensive test suite for validating MCP server functionality
+ * Tests assert real BEHAVIOUR, not just that calls return without throwing:
+ *   - lexical search finds exact tokens
+ *   - SEMANTIC search finds paraphrase ("compilation failing" -> "build is broken")
+ *   - write-time consolidation supersedes near-duplicates (and hides them)
+ *   - metadata filters are applied in SQL and the total count respects them
+ *   - the server degrades to lexical-only when embeddings are unavailable
+ *
+ * Semantic tests SKIP (not fail) if the embedding model can't load (e.g. offline
+ * on first run), so the suite still validates the lexical floor everywhere.
+ *
+ * Every test runs against a throwaway DB in the OS temp dir — never the user's
+ * real ~/.durandal-mcp database.
  */
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const DatabaseAdapter = require('./db-adapter');
-const MCPDatabaseClient = require('./mcp-db-client');
+const MemoryDB = require('./db');
 const Logger = require('./logger');
-const { ValidationError, DatabaseError } = require('./errors');
+const { ValidationError } = require('./errors');
+
+// A stub embedder used to prove graceful degradation to lexical-only.
+const NULL_EMBEDDER = {
+    enabled: false, _failed: true, dim: 384, model: 'disabled',
+    get available() { return false; },
+    get loaded() { return false; },
+    async embed() { return null; },
+    async embedBatch(texts) { return texts.map(() => null); },
+    warmup() {}
+};
 
 class TestRunner {
     constructor(logger = null) {
@@ -19,448 +39,301 @@ class TestRunner {
         this.tests = [];
         this.passed = 0;
         this.failed = 0;
+        this.skipped = 0;
         this.startTime = Date.now();
+        this._tempFiles = [];
 
-        // Test isolation: point every test at a fresh, disposable SQLite file.
-        // Previously `npm test` ran against whatever DB the resolution logic
-        // picked — typically the user's real ~/.durandal-mcp database —
-        // adding 100+ junk rows from the performance test on each run.
         if (!process.env.DURANDAL_TEST_KEEP_DB) {
-            this._tempDbPath = path.join(os.tmpdir(), `durandal-test-${Date.now()}-${process.pid}.db`);
+            this._tempDbPath = this._tmp('main');
             process.env.DATABASE_PATH = this._tempDbPath;
-            // Disable update checks during tests
             process.env.NO_UPDATE_CHECK = '1';
         }
     }
 
-    /**
-     * Run all tests
-     */
+    _tmp(tag) {
+        const p = path.join(os.tmpdir(), `durandal-test-${tag}-${Date.now()}-${process.pid}.db`);
+        this._tempFiles.push(p);
+        return p;
+    }
+
     async runAllTests() {
-        console.log('Running Durandal MCP Server Tests...\n');
-        console.log('=' . repeat(50));
+        console.log('Running Durandal MCP Server Tests (v4 — hybrid memory)\n');
+        console.log('='.repeat(56));
 
-        // Database tests
-        await this.runTest('Database Connection', this.testDatabaseConnection.bind(this));
-        await this.runTest('Schema Validation', this.testSchemaValidation.bind(this));
+        // One shared DB for the data tests (one process, one embedder load).
+        this.db = new MemoryDB();
+        await this.db.ready;
 
-        // Memory operations tests
-        await this.runTest('Store Memory', this.testStoreMemory.bind(this));
-        await this.runTest('Search Memory', this.testSearchMemory.bind(this));
-        await this.runTest('Get Recent Memories', this.testGetRecentMemories.bind(this));
+        // Probe whether semantic search is actually available on this machine.
+        const probe = await this.db.embedder.embed('availability probe');
+        this.semantic = !!probe && this.db.vecAvailable;
+        console.log(this.semantic
+            ? `  Semantic search: ENABLED (${this.db.embedder.model})\n`
+            : `  Semantic search: UNAVAILABLE — semantic tests will be skipped (lexical floor still tested)\n`);
 
-        // Cache tests
-        await this.runTest('Cache Operations', this.testCacheOperations.bind(this));
+        await this.runTest('Database connection', this.testConnection.bind(this));
+        await this.runTest('Schema + indexes (incl. vec table)', this.testSchema.bind(this));
+        await this.runTest('Store + get round-trip', this.testStoreGet.bind(this));
+        await this.runTest('Lexical search (exact tokens)', this.testLexical.bind(this));
+        await this.runTest('Semantic recall (paraphrase)', this.testSemantic.bind(this));
+        await this.runTest('Consolidation supersedes near-duplicate', this.testConsolidation.bind(this));
+        await this.runTest('Semantic recall is project-scoped', this.testSemanticScoped.bind(this));
+        await this.runTest('Filters applied in SQL + filter-aware total', this.testFilters.bind(this));
+        await this.runTest('find_similar', this.testFindSimilar.bind(this));
+        await this.runTest('Graceful degradation (embeddings off)', this.testDegradation.bind(this));
+        await this.runTest('MCP tool registry (20 tools)', this.testMCPTools.bind(this));
+        await this.runTest('Error types + clean not-found', this.testErrors.bind(this));
+        await this.runTest('Performance sanity', this.testPerformance.bind(this));
 
-        // MCP tool tests
-        await this.runTest('MCP Tool Availability', this.testMCPTools.bind(this));
-
-        // Error handling tests
-        await this.runTest('Error Handling', this.testErrorHandling.bind(this));
-
-        // Performance tests
-        await this.runTest('Performance Benchmarks', this.testPerformance.bind(this));
-
-        // Print summary
         this.printSummary();
-
-        // Clean up the temp database we created for isolation.
-        if (this._tempDbPath) {
-            try {
-                fs.unlinkSync(this._tempDbPath);
-                // SQLite may have left WAL/SHM siblings
-                for (const ext of ['-wal', '-shm', '-journal']) {
-                    const sibling = this._tempDbPath + ext;
-                    if (fs.existsSync(sibling)) fs.unlinkSync(sibling);
-                }
-            } catch (_) { /* best-effort cleanup */ }
-        }
-
+        this._cleanup();
         return this.failed === 0;
     }
 
-    /**
-     * Run a single test with error handling
-     */
-    async runTest(name, testFn) {
-        const test = {
-            name,
-            started: Date.now(),
-            status: 'running'
-        };
-
-        this.tests.push(test);
-
+    async runTest(name, fn) {
+        const t = { name, started: Date.now(), status: 'running' };
+        this.tests.push(t);
         try {
             process.stdout.write(`  ${name}...`);
-            await testFn();
-
-            test.status = 'passed';
-            test.duration = Date.now() - test.started;
-            this.passed++;
-
-            console.log(` [PASS] (${test.duration}ms)`);
+            const r = await fn();
+            t.duration = Date.now() - t.started;
+            if (r && r.skipped) {
+                t.status = 'skipped';
+                this.skipped++;
+                console.log(` [SKIP] ${r.reason || ''}`);
+            } else {
+                t.status = 'passed';
+                this.passed++;
+                console.log(` [PASS] (${t.duration}ms)`);
+            }
         } catch (error) {
-            test.status = 'failed';
-            test.duration = Date.now() - test.started;
-            test.error = error.message;
+            t.status = 'failed';
+            t.duration = Date.now() - t.started;
+            t.error = error.message;
             this.failed++;
-
-            console.log(` [FAIL] (${test.duration}ms)`);
+            console.log(` [FAIL] (${t.duration}ms)`);
             console.log(`    Error: ${error.message}`);
-
-            if (process.env.VERBOSE === 'true') {
-                console.log(`    Stack: ${error.stack}`);
-            }
+            if (process.env.VERBOSE === 'true') console.log(`    Stack: ${error.stack}`);
         }
     }
 
-    /**
-     * Test database connection
-     */
-    async testDatabaseConnection() {
-        const db = new MCPDatabaseClient();
-        const result = await db.testConnection();
+    // --- assertions ----------------------------------------------------------
 
-        if (!result.success) {
-            throw new Error(`Database connection failed: ${result.error}`);
-        }
+    assert(cond, msg) { if (!cond) throw new Error(msg); }
 
-        // Test that we can actually query
-        const testQuery = await db.query('SELECT 1 as test');
-        if (!testQuery.rows || testQuery.rows[0].test !== 1) {
-            throw new Error('Database query test failed');
-        }
+    // --- tests ---------------------------------------------------------------
 
-        await db.close();
+    async testConnection() {
+        const r = this.db.testConnection();
+        this.assert(r.success, `connection failed: ${r.error}`);
+        this.assert(this.db.query('SELECT 1 AS x').rows[0].x === 1, 'SELECT 1 failed');
     }
 
-    /**
-     * Test database schema — the MCP server now uses a single-table schema.
-     * Legacy multi-table (projects/conversation_sessions/conversation_messages)
-     * are no longer created because they were never populated by the MCP path.
-     */
-    async testSchemaValidation() {
-        const db = new MCPDatabaseClient();
-
-        const memoriesTable = await db.query(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-            ['memories']
-        );
-        if (memoriesTable.rows.length === 0) {
-            throw new Error('Missing table: memories');
+    async testSchema() {
+        const tables = this.db.listTables();
+        this.assert(tables.includes('memories'), 'missing memories table');
+        const cols = this.db.tableColumns('memories');
+        for (const c of ['id', 'content', 'metadata', 'created_at', 'updated_at', 'superseded_by']) {
+            this.assert(cols.includes(c), `missing column: ${c}`);
         }
-
-        // Verify all required columns exist by selecting them
-        await db.query(
-            "SELECT id, content, metadata, created_at FROM memories LIMIT 0"
-        );
-
-        // Verify the project/session indexes exist (performance)
-        const indexes = await db.query(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'"
-        );
-        const indexNames = indexes.rows.map(r => r.name);
-        const required = ['idx_memories_created_at', 'idx_memories_project', 'idx_memories_session'];
-        for (const idx of required) {
-            if (!indexNames.includes(idx)) {
-                throw new Error(`Missing index: ${idx}`);
-            }
+        this.assert(this.db.ftsAvailable, 'FTS5 should be available');
+        if (this.semantic) {
+            this.assert(tables.includes('vec_memories'), 'missing vec_memories table when semantic enabled');
         }
-
-        await db.close();
     }
 
-    /**
-     * Test storing memory
-     */
-    async testStoreMemory() {
-        const db = new MCPDatabaseClient();
-
-        const testContent = 'Test memory content ' + Date.now();
-        const testMetadata = {
-            importance: 0.8,
-            categories: ['test', 'validation'],
-            keywords: ['test', 'memory'],
-            project: 'test-project',
-            session: 'test-session'
-        };
-
-        const result = await db.storeMemory(testContent, testMetadata);
-
-        if (!result.success) {
-            throw new Error(`Failed to store memory: ${result.error}`);
-        }
-
-        if (!result.id) {
-            throw new Error('Store memory did not return an ID');
-        }
-
-        // Verify it was stored
-        const stored = await db.getMemoryById(result.id);
-        if (!stored) {
-            throw new Error('Could not retrieve stored memory');
-        }
-
-        if (stored.content !== testContent) {
-            throw new Error('Stored content does not match');
-        }
-
-        await db.close();
-    }
-
-    /**
-     * Test searching memories
-     */
-    async testSearchMemory() {
-        const db = new MCPDatabaseClient();
-
-        // Store a memory to search for
-        const uniqueContent = 'Unique test content ' + Date.now();
-        await db.storeMemory(uniqueContent, {
-            importance: 0.9,
-            categories: ['searchtest']
+    async testStoreGet() {
+        const content = 'Round-trip content ' + Date.now();
+        const res = await this.db.storeMemory(content, {
+            project: 'rt', session: 's1', importance: 0.8, categories: ['a', 'b']
         });
-
-        // Search for it
-        const results = await db.searchMemories('Unique test content');
-
-        if (!Array.isArray(results)) {
-            throw new Error('Search did not return an array');
-        }
-
-        const found = results.find(r => r.content.includes(uniqueContent));
-        if (!found) {
-            throw new Error('Search did not find the test memory');
-        }
-
-        await db.close();
+        this.assert(res.success && res.id, `store failed: ${res.error}`);
+        const got = this.db.getMemoryById(res.id);
+        this.assert(got && got.content === content, 'get did not round-trip content');
+        this.assert(got.metadata.importance === 0.8, 'metadata not preserved');
     }
 
-    /**
-     * Test getting recent memories
-     */
-    async testGetRecentMemories() {
-        const db = new MCPDatabaseClient();
-
-        // Store some memories
-        for (let i = 0; i < 3; i++) {
-            await db.storeMemory(`Recent memory ${i}`, {
-                importance: 0.5,
-                project: 'recent-test'
-            });
-        }
-
-        // Get recent memories
-        const recent = await db.getRecentMemories(10, 'recent-test');
-
-        if (!Array.isArray(recent)) {
-            throw new Error('getRecentMemories did not return an array');
-        }
-
-        if (recent.length === 0) {
-            throw new Error('No recent memories returned');
-        }
-
-        await db.close();
+    async testLexical() {
+        const token = 'ztokenq' + Date.now();
+        await this.db.storeMemory(`a memory containing ${token} as an exact token`, { project: 'lex' });
+        const { results, total } = await this.db.searchMemories(token, { project: 'lex' });
+        this.assert(results.length >= 1, 'lexical search found nothing');
+        this.assert(results[0].content.includes(token), 'top result missing the token');
+        this.assert(results[0].signals.includes('lexical'), 'lexical signal not reported');
+        this.assert(total >= 1, 'total should be >= 1');
     }
 
-    /**
-     * Test cache operations
-     */
-    async testCacheOperations() {
-        // Simple cache test - would be more comprehensive with actual cache implementation
-        const cache = new Map();
+    async testSemantic() {
+        if (!this.semantic) return { skipped: true, reason: '(embeddings unavailable)' };
+        // Store a statement, then search with NO shared tokens. Lexical/BM25 alone
+        // would return nothing here — only semantic recall can find it.
+        await this.db.storeMemory('the build is broken after the latest merge', { project: 'sem' });
+        await this.db.storeMemory('remember to water the office plants on fridays', { project: 'sem' });
+        const { results } = await this.db.searchMemories('compilation is failing', { project: 'sem' });
+        const hit = results.find(r => r.content.includes('the build is broken'));
+        this.assert(hit, 'semantic search did NOT find the paraphrased memory');
+        this.assert(hit.signals.includes('semantic'), 'semantic signal not reported on the hit');
+        // And it should rank above the unrelated "plants" memory.
+        const plantsIdx = results.findIndex(r => r.content.includes('plants'));
+        const hitIdx = results.findIndex(r => r.content.includes('the build is broken'));
+        this.assert(plantsIdx === -1 || hitIdx < plantsIdx, 'paraphrase did not outrank unrelated memory');
+    }
 
-        // Test set
-        cache.set('test-key', { data: 'test-value' });
+    async testConsolidation() {
+        if (!this.semantic) return { skipped: true, reason: '(needs embeddings)' };
+        const content = 'consolidation marker: I prefer four-space indentation ' + Date.now();
+        const first = await this.db.storeMemory(content, { project: 'consol' });
+        this.assert(first.success && !first.supersededId, 'first store should not supersede anything');
+        // Storing identical content again is an exact near-duplicate (distance ~0).
+        const second = await this.db.storeMemory(content, { project: 'consol' });
+        this.assert(second.supersededId === first.id,
+            `expected store to supersede #${first.id}, got ${second.supersededId}`);
+        // The superseded one must be hidden from search + recent.
+        const { results } = await this.db.searchMemories('four-space indentation', { project: 'consol' });
+        this.assert(!results.some(r => r.id === first.id), 'superseded memory still appears in search');
+        const recent = this.db.getRecentMemories(50, 'consol');
+        this.assert(!recent.some(r => r.id === first.id), 'superseded memory still appears in recent');
+        // But it is NOT deleted — still fetchable by id.
+        this.assert(this.db.getMemoryById(first.id) !== null, 'superseded memory was deleted (should be retained)');
+        this.assert(this.db.stats().superseded >= 1, 'stats.superseded should count it');
+    }
 
-        // Test get
-        const value = cache.get('test-key');
-        if (!value || value.data !== 'test-value') {
-            throw new Error('Cache get/set failed');
+    async testSemanticScoped() {
+        if (!this.semantic) return { skipped: true, reason: '(needs embeddings)' };
+        // Regression guard for project-filtered vector KNN: a target in one project
+        // must be recalled semantically, and a search scoped to that project must
+        // never leak rows from another project (the bug a global KNN would cause).
+        await this.db.storeMemory('the kubernetes ingress is misconfigured', { project: 'mpA' });
+        for (let i = 0; i < 6; i++) {
+            await this.db.storeMemory(`team lunch plans note ${i}`, { project: 'mpB' });
         }
+        const { results } = await this.db.searchMemories('the ingress routing is broken', { project: 'mpA' });
+        this.assert(results.length >= 1, 'project-scoped semantic search returned nothing');
+        this.assert(results.every(r => r.metadata.project === 'mpA'), 'project filter leaked other-project rows');
+        this.assert(results.some(r => r.content.includes('kubernetes ingress')), 'did not recall the in-project target');
+    }
 
-        // Test delete
-        cache.delete('test-key');
-        if (cache.has('test-key')) {
-            throw new Error('Cache delete failed');
-        }
+    async testFilters() {
+        const tag = 'flt' + Date.now();
+        await this.db.storeMemory(`${tag} high one`, { project: 'fltA', importance: 0.9, categories: ['x'] });
+        await this.db.storeMemory(`${tag} low one`, { project: 'fltA', importance: 0.1, categories: ['y'] });
+        await this.db.storeMemory(`${tag} other project`, { project: 'fltB', importance: 0.9, categories: ['x'] });
 
-        // Test size limit
-        const maxSize = 100;
-        for (let i = 0; i < maxSize + 10; i++) {
-            cache.set(`key-${i}`, `value-${i}`);
-            if (cache.size > maxSize) {
-                // Would implement LRU eviction in real cache
-                const firstKey = cache.keys().next().value;
-                cache.delete(firstKey);
-            }
-        }
+        // Project filter narrows the total (the v3 wart: total used to ignore filters).
+        const a = await this.db.searchMemories(tag, { project: 'fltA' });
+        const b = await this.db.searchMemories(tag, { project: 'fltB' });
+        this.assert(a.total === 2, `project fltA total expected 2, got ${a.total}`);
+        this.assert(b.total === 1, `project fltB total expected 1, got ${b.total}`);
 
-        if (cache.size > maxSize) {
-            throw new Error('Cache size limit not enforced');
+        // Importance floor filter (applied in SQL).
+        const hi = await this.db.searchMemories(tag, { project: 'fltA', importance_min: 0.5 });
+        this.assert(hi.results.every(r => (r.metadata.importance ?? 0) >= 0.5), 'importance_min not enforced');
+        this.assert(hi.results.some(r => r.content.includes('high one')), 'importance_min dropped a valid row');
+        this.assert(!hi.results.some(r => r.content.includes('low one')), 'importance_min let a low row through');
+
+        // Category filter.
+        const cat = await this.db.searchMemories(tag, { project: 'fltA', categories: ['y'] });
+        this.assert(cat.results.length === 1 && cat.results[0].content.includes('low one'), 'category filter wrong');
+    }
+
+    async testFindSimilar() {
+        const base = await this.db.storeMemory('docker compose fails to start the postgres container', { project: 'sim' });
+        await this.db.storeMemory('the database container will not boot under docker', { project: 'sim' });
+        const similar = await this.db.findSimilar(base.id, { limit: 5 });
+        this.assert(Array.isArray(similar), 'findSimilar should return an array');
+        this.assert(!similar.some(r => r.id === base.id), 'findSimilar must exclude the source');
+        if (this.semantic) {
+            this.assert(similar.length >= 1, 'findSimilar found nothing despite a related memory');
         }
     }
 
-    /**
-     * Test MCP tools availability — instantiate the server (without starting
-     * stdio transport) and invoke the ListTools handler to confirm the tool
-     * registry is actually wired up.
-     */
+    async testDegradation() {
+        // A DB with embeddings forced off must still store + search via FTS.
+        const db2 = new MemoryDB({ dbPath: this._tmp('degraded'), embedder: NULL_EMBEDDER });
+        try {
+            const token = 'degradetoken' + Date.now();
+            const res = await db2.storeMemory(`lexical only ${token}`, { project: 'deg' });
+            this.assert(res.success, 'store failed with embeddings off');
+            this.assert(res.supersededId === null, 'no consolidation expected without embeddings');
+            const { results } = await db2.searchMemories(token, { project: 'deg' });
+            this.assert(results.length === 1, 'lexical search broke with embeddings off');
+            this.assert(db2.embeddingInfo().available === false, 'embeddingInfo should report unavailable');
+        } finally {
+            db2.close();
+        }
+    }
+
     async testMCPTools() {
-        const DurandalMCPServer = require('./durandal-mcp-server-v3');
+        const DurandalMCPServer = require('./durandal-mcp-server');
         const server = new DurandalMCPServer({ logLevel: 'error' });
-
-        // Wait for the async startup check so it doesn't log after close.
         await server.ready;
-
-        const requiredTools = [
-            'store_memory',
-            'search_memories',
-            'get_context',
-            'optimize_memory',
-            'get_status',
-            'configure_logging',
-            'get_logs',
-            'list_projects_sessions',
-            'get_memory',
-            'delete_memory',
-            'store_memories_batch',
-            'update_memory',
-            'list_memories',
-            'export_memories',
-            'import_memories',
-            'rename_project',
-            'backup_database',
-            'delete_memories_where',
-            'find_similar',
-            'tag_memory'
+        const required = [
+            'store_memory', 'search_memories', 'get_context', 'optimize_memory', 'get_status',
+            'configure_logging', 'get_logs', 'list_projects_sessions', 'get_memory', 'delete_memory',
+            'store_memories_batch', 'update_memory', 'list_memories', 'export_memories',
+            'import_memories', 'rename_project', 'backup_database', 'delete_memories_where',
+            'find_similar', 'tag_memory'
         ];
-
-        // In SDK 1.29 the high-level McpServer exposes registered tools on
-        // its _registeredTools dict. server.server on our wrapper refers to
-        // the McpServer instance (we named our wrapper's field 'server').
         const registered = Object.keys(server.server._registeredTools || {});
-        for (const tool of requiredTools) {
-            if (!registered.includes(tool)) {
-                throw new Error(`Tool not registered: ${tool}`);
-            }
+        for (const tool of required) {
+            this.assert(registered.includes(tool), `tool not registered: ${tool}`);
         }
-
-        if (server.db?.close) await server.db.close();
-        if (server.logger?.close) server.logger.close();
+        try { server.db.close(); } catch (_) {}
+        try { server.logger.close(); } catch (_) {}
     }
 
-    /**
-     * Test error handling
-     */
-    async testErrorHandling() {
-        // Test validation error
-        try {
-            if (typeof 123 !== 'string') {
-                throw new ValidationError('Content must be a string', 'content', 123);
-            }
-        } catch (error) {
-            if (!(error instanceof ValidationError)) {
-                throw new Error('ValidationError not properly thrown');
-            }
-            if (error.code !== 'VALIDATION_ERROR') {
-                throw new Error('ValidationError code incorrect');
-            }
-        }
-
-        // Test database error handling
-        const db = new MCPDatabaseClient();
-        try {
-            // Try to query a non-existent table
-            await db.query('SELECT * FROM non_existent_table');
-            throw new Error('Should have thrown an error for non-existent table');
-        } catch (error) {
-            // Expected error
-            if (!error.message.includes('no such table')) {
-                throw error;
-            }
-        }
-        await db.close();
+    async testErrors() {
+        const e = new ValidationError('bad', 'field', 1);
+        this.assert(e.code === 'VALIDATION_ERROR', 'ValidationError code wrong');
+        // Not-found paths return clean nulls/objects, not throws.
+        this.assert(this.db.getMemoryById(99999999) === null, 'missing id should return null');
+        const upd = await this.db.updateMemory(99999999, { content: 'x' });
+        this.assert(upd.success === false && upd.error === 'not_found', 'update of missing id should be not_found');
+        const del = this.db.deleteMemoryById(99999999);
+        this.assert(del.success === true && del.changes === 0, 'delete of missing id should be a no-op success');
     }
 
-    /**
-     * Test performance benchmarks
-     */
     async testPerformance() {
-        const db = new MCPDatabaseClient();
-        const iterations = 100;
-
-        // Benchmark memory storage
+        const N = 40;
         const storeStart = Date.now();
-        for (let i = 0; i < iterations; i++) {
-            await db.storeMemory(`Performance test ${i}`, {
-                importance: Math.random()
-            });
-        }
-        const storeTime = Date.now() - storeStart;
-        const storePerOp = storeTime / iterations;
+        for (let i = 0; i < N; i++) await this.db.storeMemory(`perf row ${i} ${Date.now()}`, { project: 'perf' });
+        const perStore = (Date.now() - storeStart) / N;
 
-        if (storePerOp > 50) {
-            console.warn(`    [WARN] Storage performance: ${storePerOp.toFixed(2)}ms per operation (>50ms)`);
-        }
-
-        // Benchmark search
         const searchStart = Date.now();
-        for (let i = 0; i < 10; i++) {
-            await db.searchMemories('Performance test');
-        }
-        const searchTime = Date.now() - searchStart;
-        const searchPerOp = searchTime / 10;
+        for (let i = 0; i < 10; i++) await this.db.searchMemories('perf row', { project: 'perf' });
+        const perSearch = (Date.now() - searchStart) / 10;
 
-        if (searchPerOp > 100) {
-            console.warn(`    [WARN] Search performance: ${searchPerOp.toFixed(2)}ms per operation (>100ms)`);
-        }
-
-        await db.close();
+        console.log(`\n    store ~${perStore.toFixed(1)}ms/op${this.semantic ? ' (incl. embedding)' : ''}, search ~${perSearch.toFixed(1)}ms/op`);
+        // Don't fail on perf (CPU-dependent + embedding cost) — just surface it.
     }
 
-    /**
-     * Print test summary
-     */
     printSummary() {
         const totalTime = Date.now() - this.startTime;
-
-        console.log('\n' + '=' . repeat(50));
-        console.log('Test Summary:');
-        console.log('=' . repeat(50));
-
-        console.log(`\n  Total Tests: ${this.tests.length}`);
-        console.log(`  [PASS] Passed: ${this.passed}`);
-        console.log(`  [FAIL] Failed: ${this.failed}`);
+        console.log('\n' + '='.repeat(56));
+        console.log(`  Total: ${this.tests.length}   Passed: ${this.passed}   Failed: ${this.failed}   Skipped: ${this.skipped}`);
         console.log(`  Duration: ${totalTime}ms`);
-
         if (this.failed === 0) {
-            console.log('\n[SUCCESS] All tests passed!');
+            console.log('\n[SUCCESS] All tests passed' + (this.skipped ? ` (${this.skipped} skipped)` : '') + '.');
         } else {
-            console.log('\n[WARN] Some tests failed. Run with VERBOSE=true for more details.');
+            console.log('\n[FAIL] Failures:');
+            this.tests.filter(t => t.status === 'failed').forEach(t => console.log(`  - ${t.name}: ${t.error}`));
+        }
+    }
 
-            // List failed tests
-            console.log('\nFailed tests:');
-            this.tests
-                .filter(t => t.status === 'failed')
-                .forEach(t => {
-                    console.log(`  - ${t.name}: ${t.error}`);
-                });
+    _cleanup() {
+        try { this.db.close(); } catch (_) {}
+        for (const p of this._tempFiles) {
+            for (const ext of ['', '-wal', '-shm', '-journal']) {
+                try { if (fs.existsSync(p + ext)) fs.unlinkSync(p + ext); } catch (_) {}
+            }
         }
     }
 }
 
-// Allow running directly
 if (require.main === module) {
-    const runner = new TestRunner();
-    runner.runAllTests().then(success => {
-        process.exit(success ? 0 : 1);
-    }).catch(error => {
-        console.error('Test runner failed:', error);
-        process.exit(1);
-    });
+    new TestRunner().runAllTests()
+        .then(ok => process.exit(ok ? 0 : 1))
+        .catch(err => { console.error('Test runner failed:', err); process.exit(1); });
 }
 
 module.exports = TestRunner;

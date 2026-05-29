@@ -5,6 +5,59 @@ All notable changes to Durandal MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-05-29
+
+**Core Change:** Hybrid memory. Search now fuses lexical full-text (FTS5/BM25)
+with semantic search (local embeddings + sqlite-vec cosine KNN) via Reciprocal
+Rank Fusion, and writes are consolidated (near-duplicates supersede older
+memories instead of piling up). Still zero-config and local-only — no API keys.
+
+**What This Means for Users:** You can find a memory by meaning, not just exact
+words — searching *"compilation failing"* finds *"the build is broken"*. Exact
+tokens (error codes, paths, identifiers) still match precisely. Restated facts
+no longer accumulate. If the embedding model can't load, search transparently
+falls back to lexical-only, so it's never worse than before.
+
+**New Features:**
+- Hybrid lexical + semantic retrieval (RRF fusion), with per-result `signals`
+  showing which engine matched.
+- Local CPU embeddings via transformers.js (`all-MiniLM-L6-v2`, 384-d, ~23 MB,
+  downloaded once). No API, no network after first use.
+- Write-time consolidation: near-duplicate memories are superseded (hidden, not
+  deleted, reported back, reversible).
+- `find_similar` is now true semantic similarity (cosine KNN) instead of token
+  overlap.
+- `optimize_memory` gains `backfill_embeddings` to index pre-v4 / un-embedded rows.
+- `get_status` reports semantic-search health and vector count.
+
+**Architecture:**
+- Migrated `node-sqlite3` → `better-sqlite3` (synchronous; first-class extension
+  loading) + `sqlite-vec` (vectors in the same SQLite file).
+- Collapsed `mcp-db-client.js` + `db-adapter.js` into a single `db.js` (`MemoryDB`);
+  added `embeddings.js`.
+- Renamed entry `durandal-mcp-server-v3.js` → `durandal-mcp-server.js`.
+- Schema: added `updated_at` and `superseded_by` to `memories`; added the
+  `vec_memories` vector table. **Pre-v4 databases migrate non-destructively on
+  first open.**
+
+**Fixes (carried from the prior audit):**
+- `search_memories` `total` now respects all filters (was filter-blind); filters
+  are applied in SQL instead of a post-fetch JS pass with an over-fetch hack.
+- Search failures now surface as errors instead of silently returning `[]`.
+- Documentation rewritten to match the shipped system (the prior `CLAUDE.md`
+  described a removed RAMR cache and a schema that never existed).
+
+**Configuration (new):** `DURANDAL_EMBEDDINGS`, `DURANDAL_EMBED_MODEL`,
+`DURANDAL_SEMANTIC_MIN_SIM`, `DURANDAL_DEDUP_DISTANCE`, `DURANDAL_SEARCH_POOL`,
+`DURANDAL_RRF_K`.
+
+**Requirements:** Node.js ≥ 20 (better-sqlite3 prebuilt binaries).
+
+**Files Changed:** new `db.js`, `embeddings.js`; removed `mcp-db-client.js`,
+`db-adapter.js`; renamed server entry; rewrote `test-runner.js`, `ARCHITECTURE.md`,
+`CLAUDE.md`, `README.md`; ported `db-discovery.js`/`db-migrate.js`/
+`assign-projects.js` to better-sqlite3.
+
 ## [4.0.0-experimental] - 2026-04-21 (autonomous-experiment branch, unreleased)
 
 ### Core Change

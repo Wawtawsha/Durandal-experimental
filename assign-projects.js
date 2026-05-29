@@ -9,7 +9,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');
 const readline = require('readline');
 
 class ProjectAssigner {
@@ -41,150 +41,113 @@ class ProjectAssigner {
     }
 
     async connect() {
-        return new Promise((resolve, reject) => {
-            this.db = new sqlite3.Database(this.dbPath, (err) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    console.log(`Connected to database: ${this.dbPath}`);
-                    resolve();
-                }
-            });
-        });
+        // Throws on failure; the CLI catch handler reports the error message.
+        this.db = new Database(this.dbPath);
+        console.log(`Connected to database: ${this.dbPath}`);
     }
 
     async analyzeOrphans() {
-        return new Promise((resolve, reject) => {
-            // Count orphaned memories
-            this.db.get(
-                `SELECT COUNT(*) as count FROM memories
-                 WHERE json_extract(metadata, '$.project') IS NULL
-                 OR json_extract(metadata, '$.project') = ''`,
-                (err, row) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        this.orphanedCount = row.count;
+        // Count orphaned memories
+        const row = this.db.prepare(
+            `SELECT COUNT(*) as count FROM memories
+             WHERE json_extract(metadata, '$.project') IS NULL
+             OR json_extract(metadata, '$.project') = ''`
+        ).get();
+        this.orphanedCount = row.count;
 
-                        // Get existing projects
-                        this.db.all(
-                            `SELECT DISTINCT json_extract(metadata, '$.project') as project, COUNT(*) as count
-                             FROM memories
-                             WHERE json_extract(metadata, '$.project') IS NOT NULL
-                             AND json_extract(metadata, '$.project') != ''
-                             GROUP BY json_extract(metadata, '$.project')`,
-                            (err2, rows) => {
-                                if (err2) {
-                                    reject(err2);
-                                } else {
-                                    this.projects = rows;
-                                    resolve();
-                                }
-                            }
-                        );
-                    }
-                }
-            );
-        });
+        // Get existing projects
+        this.projects = this.db.prepare(
+            `SELECT DISTINCT json_extract(metadata, '$.project') as project, COUNT(*) as count
+             FROM memories
+             WHERE json_extract(metadata, '$.project') IS NOT NULL
+             AND json_extract(metadata, '$.project') != ''
+             GROUP BY json_extract(metadata, '$.project')`
+        ).all();
     }
 
     async assignProject(project, filter = {}) {
-        return new Promise((resolve, reject) => {
-            let whereClause = `WHERE (json_extract(metadata, '$.project') IS NULL OR json_extract(metadata, '$.project') = '')`;
-            let params = [];
+        let whereClause = `WHERE (json_extract(metadata, '$.project') IS NULL OR json_extract(metadata, '$.project') = '')`;
+        let params = [];
 
-            // Add filters
-            if (filter.dateFrom) {
-                whereClause += ` AND created_at >= ?`;
-                params.push(filter.dateFrom);
-            }
-            if (filter.dateTo) {
-                whereClause += ` AND created_at <= ?`;
-                params.push(filter.dateTo);
-            }
-            if (filter.contentContains) {
-                whereClause += ` AND content LIKE ?`;
-                params.push(`%${filter.contentContains}%`);
-            }
-            if (filter.limit) {
-                whereClause += ` LIMIT ?`;
-                params.push(filter.limit);
-            }
+        // Add filters
+        if (filter.dateFrom) {
+            whereClause += ` AND created_at >= ?`;
+            params.push(filter.dateFrom);
+        }
+        if (filter.dateTo) {
+            whereClause += ` AND created_at <= ?`;
+            params.push(filter.dateTo);
+        }
+        if (filter.contentContains) {
+            whereClause += ` AND content LIKE ?`;
+            params.push(`%${filter.contentContains}%`);
+        }
+        if (filter.limit) {
+            whereClause += ` LIMIT ?`;
+            params.push(filter.limit);
+        }
 
-            // First, get the memories to update
-            this.db.all(
-                `SELECT id, metadata FROM memories ${whereClause}`,
-                params,
-                (err, rows) => {
-                    if (err) {
-                        reject(err);
-                        return;
-                    }
+        // First, get the memories to update
+        const rows = this.db.prepare(
+            `SELECT id, metadata FROM memories ${whereClause}`
+        ).all(...params);
 
-                    if (rows.length === 0) {
-                        resolve(0);
-                        return;
-                    }
+        if (rows.length === 0) {
+            return 0;
+        }
 
-                    let updated = 0;
-                    const stmt = this.db.prepare(`UPDATE memories SET metadata = ? WHERE id = ?`);
+        let updated = 0;
+        const stmt = this.db.prepare(`UPDATE memories SET metadata = ? WHERE id = ?`);
 
-                    rows.forEach(row => {
-                        let metadata = {};
-                        try {
-                            metadata = row.metadata ? JSON.parse(row.metadata) : {};
-                        } catch (e) {
-                            metadata = {};
-                        }
-
-                        metadata.project = project;
-
-                        // Add session if not present
-                        if (!metadata.session) {
-                            metadata.session = new Date().toISOString().split('T')[0];
-                        }
-
-                        stmt.run(JSON.stringify(metadata), row.id, (err) => {
-                            if (!err) updated++;
-
-                            if (updated + (err ? 1 : 0) === rows.length) {
-                                stmt.finalize();
-                                resolve(updated);
-                            }
-                        });
-                    });
+        const applyUpdates = this.db.transaction(() => {
+            rows.forEach(row => {
+                let metadata = {};
+                try {
+                    metadata = row.metadata ? JSON.parse(row.metadata) : {};
+                } catch (e) {
+                    metadata = {};
                 }
-            );
+
+                metadata.project = project;
+
+                // Add session if not present
+                if (!metadata.session) {
+                    metadata.session = new Date().toISOString().split('T')[0];
+                }
+
+                try {
+                    stmt.run(JSON.stringify(metadata), row.id);
+                    updated++;
+                } catch (e) {
+                    // Skip rows that fail to update
+                }
+            });
         });
+        applyUpdates();
+
+        return updated;
     }
 
     async assignByDateRanges() {
         // Group orphans by date
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT
-                    DATE(created_at) as date,
-                    COUNT(*) as count,
-                    MIN(content) as sample
-                 FROM memories
-                 WHERE json_extract(metadata, '$.project') IS NULL
-                 OR json_extract(metadata, '$.project') = ''
-                 GROUP BY DATE(created_at)
-                 ORDER BY date DESC`,
-                async (err, rows) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        console.log('\nOrphaned memories by date:');
-                        rows.forEach(row => {
-                            console.log(`  ${row.date}: ${row.count} memories`);
-                            console.log(`    Sample: "${row.sample.substring(0, 50)}..."`);
-                        });
-                        resolve(rows);
-                    }
-                }
-            );
+        const rows = this.db.prepare(
+            `SELECT
+                DATE(created_at) as date,
+                COUNT(*) as count,
+                MIN(content) as sample
+             FROM memories
+             WHERE json_extract(metadata, '$.project') IS NULL
+             OR json_extract(metadata, '$.project') = ''
+             GROUP BY DATE(created_at)
+             ORDER BY date DESC`
+        ).all();
+
+        console.log('\nOrphaned memories by date:');
+        rows.forEach(row => {
+            console.log(`  ${row.date}: ${row.count} memories`);
+            console.log(`    Sample: "${row.sample.substring(0, 50)}..."`);
         });
+        return rows;
     }
 
     async interactiveMode() {

@@ -1,4 +1,4 @@
-# Durandal Memory MCP — architecture and capabilities
+# Durandal Memory MCP — architecture and capabilities (v4)
 
 A technical reference for what the server does and how. For install and
 quickstart, see `README.md`.
@@ -8,9 +8,26 @@ quickstart, see `README.md`.
 ## What it is
 
 A Model Context Protocol (MCP) server that gives Claude Code persistent,
-searchable memory across sessions. Single Node.js process, single SQLite
-database, stdio transport. Zero-config: first run creates
-`~/.durandal-mcp/durandal-mcp-memory.db` and a matching log directory.
+**hybrid-searchable** memory across sessions. Single Node.js process, single
+SQLite database, stdio transport. Zero-config: first run creates
+`~/.durandal-mcp/durandal-mcp-memory.db`, a log directory, and (on first
+embedding) downloads a small local embedding model to `~/.durandal-mcp/.model-cache`.
+
+Retrieval is **hybrid**: lexical full-text (SQLite FTS5 / BM25) and semantic
+(local embeddings + cosine KNN via `sqlite-vec`) candidate lists are fused with
+Reciprocal Rank Fusion. Lexical nails exact tokens (identifiers, error strings,
+file paths); semantic catches paraphrase — searching `"compilation failing"`
+finds a memory that says `"the build is broken"`, which lexical search alone
+never would.
+
+Writes are **consolidated**: a new memory that is a near-duplicate of an
+existing one (same project, cosine distance ≤ a conservative threshold) marks
+the older one *superseded* — hidden from results, never deleted, and reported
+back to the caller. This is the "selective attention" the project always
+intended, implemented as a curation layer rather than a cache.
+
+**Everything is local.** No API keys, no network after the one-time model
+download, no per-operation cost. The embedding model runs on CPU.
 
 ---
 
@@ -18,186 +35,159 @@ database, stdio transport. Zero-config: first run creates
 
 ```
 ┌────────────────────────┐       stdin/stdout JSON-RPC        ┌──────────────────────┐
-│   Claude Code client   │ ←───────────────────────────────→ │   durandal-mcp       │
-└────────────────────────┘   (MCP 1.29 over stdio)           │   (this server)      │
-                                                              │                      │
-                                                              │   ┌──────────────┐   │
-                                                              │   │ McpServer    │   │ tool dispatch, Zod validation
-                                                              │   │ (SDK 1.29)   │   │ annotations, outputSchema
-                                                              │   └──────┬───────┘   │
-                                                              │          │           │
-                                                              │   ┌──────▼───────┐   │
-                                                              │   │ handlers     │   │ prepareStoredMetadata,
-                                                              │   │ + wrapHandler│   │ MCP log notifications
-                                                              │   └──────┬───────┘   │
-                                                              │          │           │
-                                                              │   ┌──────▼───────┐   │
-                                                              │   │ DatabaseAdpt │   │ thin facade
-                                                              │   └──────┬───────┘   │
-                                                              │          │           │
-                                                              │   ┌──────▼───────┐   │
-                                                              │   │ MCPDbClient  │   │ SQLite + FTS5
-                                                              │   └──────┬───────┘   │
-                                                              │          │           │
-                                                              │   ┌──────▼───────┐   │
-                                                              │   │ ~/.durandal- │   │
-                                                              │   │ mcp/*.db     │   │
-                                                              │   └──────────────┘   │
+│   Claude Code client   │ ←───────────────────────────────→ │   durandal-mcp        │
+└────────────────────────┘   (MCP 1.29 over stdio)           │   (this server)       │
+                                                              │   ┌──────────────┐    │
+                                                              │   │ McpServer    │    │ tool dispatch, Zod
+                                                              │   │ (SDK 1.29)   │    │ validation, outputSchema
+                                                              │   └──────┬───────┘    │
+                                                              │   ┌──────▼───────┐    │
+                                                              │   │ handlers     │    │ wrapHandler: logging,
+                                                              │   │ + wrapHandler│    │ MCP log notifications
+                                                              │   └──────┬───────┘    │
+                                                              │   ┌──────▼───────┐    │
+                                                              │   │ MemoryDB     │    │ hybrid search + consolidation
+                                                              │   │ (db.js)      │    │
+                                                              │   └──┬────────┬──┘    │
+                                                              │      │        │       │
+                                                              │  ┌───▼──┐  ┌──▼─────┐ │
+                                                              │  │better│  │Embedder│ │ all-MiniLM-L6-v2
+                                                              │  │sqlite│  │(local) │ │ (transformers.js)
+                                                              │  │ +vec │  └────────┘ │
+                                                              │  │ +fts │             │
+                                                              │  └──┬───┘             │
+                                                              │  ┌──▼──────────┐      │
+                                                              │  │ ~/.durandal-│      │
+                                                              │  │ mcp/*.db    │      │
+                                                              │  └─────────────┘      │
                                                               └──────────────────────┘
 ```
 
-Everything non-protocol (logs, DB discovery banners, update notifications)
-is routed to **stderr**. stdout is exclusively JSON-RPC.
+Everything non-protocol (logs, DB banners, model-load messages, update
+notifications) is routed to **stderr**. stdout is exclusively JSON-RPC.
 
 ---
 
 ## Storage
 
-Single SQLite file. One table, one FTS5 virtual table, three triggers.
+Single SQLite file. One source-of-truth table, one FTS5 virtual table, one
+`sqlite-vec` vector table, three FTS sync triggers.
 
 ```sql
 CREATE TABLE memories (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    content    TEXT NOT NULL,
-    metadata   TEXT,              -- JSON: project, session, importance, categories, keywords, ...
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    content       TEXT NOT NULL,
+    metadata      TEXT,              -- JSON: project, session, importance, categories, keywords, ...
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at    DATETIME,          -- stamped on insert/update
+    superseded_by INTEGER            -- id of the memory that replaced this one; NULL = active
 );
-
 CREATE INDEX idx_memories_created_at ON memories(created_at);
-CREATE INDEX idx_memories_project    ON memories(json_extract(metadata, '$.project')) WHERE ...;
-CREATE INDEX idx_memories_session    ON memories(json_extract(metadata, '$.session')) WHERE ...;
+CREATE INDEX idx_memories_superseded ON memories(superseded_by);
+CREATE INDEX idx_memories_project    ON memories(json_extract(metadata,'$.project')) WHERE ...;
+CREATE INDEX idx_memories_session    ON memories(json_extract(metadata,'$.session')) WHERE ...;
 
 CREATE VIRTUAL TABLE memories_fts USING fts5(
     content, content='memories', content_rowid='id', tokenize='porter unicode61'
 );
--- + AFTER INSERT / AFTER DELETE / AFTER UPDATE triggers keeping FTS in sync
+-- + AFTER INSERT / DELETE / UPDATE triggers keep FTS in sync
+
+CREATE VIRTUAL TABLE vec_memories USING vec0(   -- only if sqlite-vec loads
+    memory_id INTEGER PRIMARY KEY,               -- == memories.id
+    embedding FLOAT[384] distance_metric=cosine, -- all-MiniLM-L6-v2
+    project   TEXT                               -- for same-project consolidation KNN
+);
 ```
 
-Databases created before FTS existed are backfilled automatically via
-`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')` on first open.
+The `memories` table is the single source of truth. The FTS and vector tables
+are indexes over it; `superseded_by` (and all metadata filters) are always
+re-checked against `memories` when assembling results, so the indexes can never
+return a stale or superseded row.
+
+Pre-v4 databases (which had only `id/content/metadata/created_at`) are migrated
+non-destructively on first open: `updated_at` and `superseded_by` are added via
+`ALTER TABLE`, the FTS index is backfilled if empty, and existing rows can be
+embedded on demand with the `backfill_embeddings` optimize operation.
+
+---
+
+## Retrieval: hybrid search
+
+`search_memories(query, filters?, limit?)`:
+
+1. **Lexical candidates** — FTS5 `MATCH` with BM25 ranking + `snippet()`
+   highlighting, restricted to active rows and the metadata filters (in SQL).
+   Query tokenized on `[^\p{L}\p{N}_]+`, AND-joined.
+2. **Semantic candidates** — embed the query, KNN over `vec_memories` (cosine),
+   keep only hits with similarity ≥ `SEMANTIC_MIN_SIM` (default 0.35) so a small
+   store doesn't return everything just because vectors always have a nearest
+   point.
+3. **Fusion** — the two ranked id-lists are combined with Reciprocal Rank Fusion
+   (`score = Σ 1/(k + rank)`, `k=60`). With one signal present this reduces to
+   that signal's order.
+4. **Fetch + filter** — full rows for the fused ids are fetched in one query that
+   re-applies *all* filters and `superseded_by IS NULL`. Each result is tagged
+   with the `signals` that matched (`lexical` / `semantic` / `substring`).
+5. **Tiebreak** — near-equal fused scores are broken by importance, then recency.
+
+`total` is the count of **lexical matches passing the filters** — a well-defined
+pagination number. (Semantic neighbours can add related results within the
+returned window; "total semantic matches" is not well-defined since everything
+has *some* cosine similarity.)
+
+**Fallbacks, in order:** FTS unavailable → LIKE substring (wildcards escaped).
+Query tokenizes to nothing and no embeddings → LIKE. Embeddings unavailable →
+lexical only. **The server is never worse than a pure FTS5/BM25 store.**
+
+---
+
+## Writes: consolidation
+
+`store_memory`:
+
+1. Embed the content (before any transaction — better-sqlite3 transactions are
+   synchronous).
+2. In one transaction: insert the row; insert its embedding; find the nearest
+   *active, same-project* neighbour; if its cosine distance ≤ `NEAR_DUP_DISTANCE`
+   (default 0.08 ≈ similarity 0.92), set that neighbour's `superseded_by` to the
+   new id.
+3. Return the new id and the superseded id (if any).
+
+Consolidation is conservative and **reversible** — superseded rows are retained
+(fetchable by id, restored if their superseder is deleted) and the action is
+always reported. It exists to stop near-duplicate / restated facts from piling
+up, not to make irreversible judgements. Contradiction detection beyond near-
+duplication is intentionally out of scope (it would require an LLM in the write
+path; see "Not in scope").
 
 ---
 
 ## MCP surface
 
-Capabilities advertised in `initialize`:
-
 | Capability | Notes |
 |---|---|
-| `tools` (20)                  | All validated by Zod; many declare `outputSchema` for typed responses |
-| `resources`                   | URI template `durandal://memory/{id}` + list of 100 most recent |
-| `prompts`                     | One template: `summarize_recent_memories` |
-| `logging`                     | Server emits `notifications/message` on every tool call |
+| `tools` (20)  | Zod-validated; many declare `outputSchema` for typed responses |
+| `resources`   | `durandal://memory/{id}` + list of 100 most recent |
+| `prompts`     | `summarize_recent_memories` |
+| `logging`     | `notifications/message` emitted per tool call |
 
-Tool results always carry `content[]` (text) and, where useful, `structuredContent` (typed payload). Tools also declare annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so clients can show appropriate UI guardrails.
+### Tools
 
----
+**Core:** `store_memory` (embed + consolidate), `search_memories` (hybrid),
+`get_context`, `get_memory`, `update_memory` (re-embeds on content change),
+`delete_memory` (removes the vector too), `list_memories`.
 
-## Tools
+**Bulk:** `store_memories_batch` (embeds the batch; skips consolidation),
+`export_memories` (lossless — includes superseded), `import_memories`,
+`rename_project`, `delete_memories_where` (filter required).
 
-### Core memory operations
+**Discovery:** `find_similar` (semantic KNN, lexical fallback),
+`list_projects_sessions`, `tag_memory`.
 
-| Tool | What | How |
-|---|---|---|
-| `store_memory`   | Persist one memory | Defaults `project`/`session`, stamps `created_at`, enforces 64 KB metadata cap, inserts, returns DB autoincrement id |
-| `get_memory`     | Fetch one by id | Single parameterized SELECT; metadata parsed defensively (`_parseRow`) |
-| `update_memory`  | Edit content and/or metadata in place | Preserves original `created_at`; 64 KB cap re-applied |
-| `delete_memory`  | Delete one by id | DELETE WHERE id=?; FTS trigger removes the match |
-| `search_memories`| Full-text search with filters | FTS5 MATCH with BM25 ranking + `snippet()` highlighting; query tokenized on `[^\p{L}\p{N}_]+` and AND-joined; post-filters `importance_min/max` and `categories` in JS; returns `total` count for pagination; falls back to LIKE (`ESCAPE '\'`) if FTS unavailable or query empties |
-| `get_context`    | Recent memories for a project/session with stats | `getRecentMemories` + one aggregated `stats()` call (total + in-project count) |
-| `list_memories`  | Paginated browse without a query | `WHERE project/session/since/until` + `ORDER BY created_at DESC LIMIT ? OFFSET ?`; parallel `COUNT(*)` for `total` |
-
-### Bulk operations
-
-| Tool | What | How |
-|---|---|---|
-| `store_memories_batch` | Insert N memories in one transaction | `BEGIN` + prepared statement looped + `COMMIT`, rolls back on any error |
-| `export_memories`      | Dump every row as JSON | Single SELECT ordered by id; payload in `structuredContent` only (not inlined in text to keep response size sane) |
-| `import_memories`      | Reload from an export payload | Runs each item through `prepareStoredMetadata(false)` (size cap only — preserves original `created_at` and defaults); produces non-fatal warnings for out-of-range values |
-| `rename_project`       | Move every row under `from` to `to` | Single `UPDATE ... SET metadata = json_set(metadata, '$.project', ?)` — no row-by-row read |
-| `delete_memories_where`| Bulk delete by filter | DELETE with at-least-one-filter guard; refuses unfiltered bulk deletes |
-| `tag_memory`           | Add/remove categories | Reads existing metadata, set-unions add, set-removes remove, writes back — preserves all other fields |
-
-### Discovery
-
-| Tool | What | How |
-|---|---|---|
-| `find_similar`           | "More like this" given a memory id | Tokenizes the source's content, drops words under 3 chars, takes top 12, OR-joins them as an FTS query, excludes source id, BM25-ranks; LIKE fallback on first 64 chars if FTS unavailable |
-| `list_projects_sessions` | Project/session summary with counts and samples | Single GROUP BY query for aggregates; samples via one batched `ROW_NUMBER() OVER (PARTITION BY ...)` query (not N+1) |
-
-### Admin and maintenance
-
-| Tool | What | How |
-|---|---|---|
-| `optimize_memory`   | Run SQLite maintenance | Dispatches `vacuum` / `analyze` / `integrity_check` / `wal_checkpoint`; reports size-before/size-after |
-| `backup_database`   | Atomic snapshot | `VACUUM INTO 'path'` — consistent even under concurrent writes; no downtime |
-| `get_status`        | Health + stats dashboard | Reads DB size + row counts via `stats()`, FTS availability flag, log paths, process metrics |
-| `configure_logging` | Set log levels at runtime | Writes to `~/.durandal-mcp/.env` (same file server reads on startup); anchored `^KEY=...$` regex |
-| `get_logs`          | Recent log entries | Streams log file via `readline` into a rolling ring buffer sized `max(lines×4, 100)`; avoids loading 10+ MB logs whole |
-
-### Resources
-
-| URI pattern | Produces | How |
-|---|---|---|
-| `durandal://memory/{id}` | JSON blob of one memory | Parses `id` as integer, validates positive, calls `getMemoryById`, returns `contents[].text` as pretty-printed JSON. `list()` returns the 100 most recent as resource descriptors. |
-
-### Prompt templates
-
-| Name | What | How |
-|---|---|---|
-| `summarize_recent_memories` | User-role prompt ready to send to Claude | Takes `project?` and `limit?`, fetches those recent rows, formats as a `role:user` message asking Claude to summarize and flag follow-ups |
-
----
-
-## Request lifecycle
-
-Every tool call flows through one wrapper (`wrapHandler`):
-
-1. **Logger.startMCPTool** — record name, args, generate request id.
-2. **MCP log notification** (`debug`, `tool_call_start`) — sent to client over protocol.
-3. **Zod validation** happens before this wrapper runs (inside the SDK). Bad input returns `isError: true` with Zod's "expected X, received Y" text.
-4. **Handler executes** — all DB access via `DatabaseAdapter` methods.
-5. **Success path**: logger records completion + duration; MCP log (`info`, `tool_call_complete`).
-6. **Error path**: `ErrorHandler.handle` wraps the error, attaches recovery hint from `errors.js` SQLITE-code-aware mapping; response is `{ isError: true, content: [{ type: 'text', text: '[ERR] … Recovery: …' }] }`; MCP log (`error`, `tool_call_error`).
-
-Protocol log notifications are best-effort: a disconnected transport never aborts a handler.
-
----
-
-## Startup sequence
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│ 1. loadPersistedConfig()                                            │
-│    reads ~/.durandal-mcp/.env, sets process.env defaults            │
-├────────────────────────────────────────────────────────────────────┤
-│ 2. new Logger(...)                                                  │
-│    opens ~/.durandal-mcp/logs/durandal-YYYY-MM-DD.log (append)      │
-│    rotates if > 10 MB                                               │
-├────────────────────────────────────────────────────────────────────┤
-│ 3. new McpServer(...)                                               │
-│    declares tools/resources/prompts/logging capabilities            │
-├────────────────────────────────────────────────────────────────────┤
-│ 4. new DatabaseAdapter()                                            │
-│    resolves DB path (DATABASE_PATH env > known locations > fresh)   │
-│    opens sqlite3 handle, exposes `ready` promise                    │
-│    initializes schema + FTS triggers + backfills FTS if needed      │
-├────────────────────────────────────────────────────────────────────┤
-│ 5. this.ready = runDatabaseStartupCheck()                           │
-│    connectivity → schema → read/write → integrity_check (awaited    │
-│    by anything that needs ordering; failures flag but don't abort)  │
-├────────────────────────────────────────────────────────────────────┤
-│ 6. registerTools() — all 20 + resource template + prompt template   │
-├────────────────────────────────────────────────────────────────────┤
-│ 7. server.connect(stdio transport) — start serving                  │
-├────────────────────────────────────────────────────────────────────┤
-│ 8. checkForUpdates() — fire-and-forget; notifies via stderr only    │
-└────────────────────────────────────────────────────────────────────┘
-```
-
-Shutdown: idempotent, awaits in-flight startup check, runs
-`PRAGMA wal_checkpoint(TRUNCATE)` so the `-wal` sibling doesn't grow
-forever, closes handles, exits 0 (or 1 for `uncaughtException`).
+**Admin:** `optimize_memory` (`vacuum`/`analyze`/`integrity_check`/
+`wal_checkpoint`/`backfill_embeddings`), `backup_database` (`VACUUM INTO`),
+`get_status` (now includes semantic-search health + vector count),
+`configure_logging`, `get_logs`.
 
 ---
 
@@ -207,77 +197,87 @@ All optional.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DATABASE_PATH`     | `~/.durandal-mcp/durandal-mcp-memory.db` | Override DB location |
-| `CONSOLE_LOG_LEVEL` | `warn`                                    | Terminal output level |
-| `FILE_LOG_LEVEL`    | `info`                                    | File log detail level |
-| `LOG_LEVEL`         | —                                         | Legacy: sets both |
-| `LOG_FILE`          | `~/.durandal-mcp/logs/durandal-YYYY-MM-DD.log` | Override log path |
-| `ERROR_LOG_FILE`    | —                                         | Optional separate error log |
-| `VERBOSE`           | `false`                                   | Include full meta in logs |
-| `DEBUG`             | `false`                                   | Force debug level |
-| `LOG_MCP_TOOLS`     | `false`                                   | Log every tool call with args |
-| `NO_UPDATE_CHECK`   | `false`                                   | Skip npm-registry check |
+| `DATABASE_PATH`            | `~/.durandal-mcp/durandal-mcp-memory.db` | DB location |
+| `DURANDAL_EMBEDDINGS`      | `true`                | Set `false` to force lexical-only |
+| `DURANDAL_EMBED_MODEL`     | `Xenova/all-MiniLM-L6-v2` | Embedding model id |
+| `DURANDAL_SEMANTIC_MIN_SIM`| `0.35`                | Min cosine similarity for a semantic hit |
+| `DURANDAL_DEDUP_DISTANCE`  | `0.08`                | Max cosine distance to treat as a near-duplicate |
+| `DURANDAL_SEARCH_POOL`     | `50`                  | Candidate pool size per signal |
+| `DURANDAL_RRF_K`           | `60`                  | RRF constant |
+| `CONSOLE_LOG_LEVEL`        | `warn`                | Terminal output level (→ stderr) |
+| `FILE_LOG_LEVEL`           | `info`                | File log detail |
+| `NO_UPDATE_CHECK`          | `false`               | Skip npm-registry check |
 
-Persisted config file: `~/.durandal-mcp/.env` (same format, keys NOT overridden if already in `process.env`).
-
-CLI: `--help`, `--version`, `--test`, `--status`, `--discover`, `--migrate`, `--configure`, `--update`, `--debug`, `--verbose`, `--log-file <path>`, `--log-level <lvl>`.
+CLI: `--help`, `--version`, `--test`, `--status`, `--discover`, `--migrate`,
+`--configure`, `--update`, `--debug`, `--verbose`, `--log-file`, `--log-level`.
 
 ---
 
 ## Safety invariants
 
-Guarantees enforced at the code level:
-
-- **stdout is JSON-RPC only.** Every log, every DB banner, every update notification routes to stderr.
-- **Metadata must be a plain object, serializable, ≤ 64 KB.** Rejected otherwise.
-- **`content` ≤ 50,000 characters.** Rejected otherwise.
-- **Circular-reference metadata** is caught and returns a clean ValidationError.
-- **Corrupt metadata in one row** does not wipe the result set — `_parseRow` returns `{ _corrupt: true }` for that row and moves on.
-- **LIKE wildcards in user queries** are escaped (`\%`, `\_`, `\\`) — "100%" doesn't match "anything with anything".
-- **Unfiltered bulk deletes refused** at the DB layer.
-- **VACUUM INTO destination** must not contain single quotes.
-- **Shutdown is idempotent**, runs WAL checkpoint, exits nonzero on uncaught exceptions.
-- **`npm test` runs against a temp DB** in OS temp dir (set via `DATABASE_PATH` before any client is constructed) — cannot pollute the user's real memory.
+- **stdout is JSON-RPC only.** Logs, banners, model-load messages, update
+  notifications all go to stderr. The embedder sets transformers.js `logLevel`
+  to silent and never passes a progress callback.
+- **Never worse than v3.** Every semantic path degrades to lexical if
+  `sqlite-vec` or the embedding model is unavailable.
+- **Metadata ≤ 64 KB, plain serializable object.** Rejected otherwise.
+- **`content` ≤ 50,000 characters.**
+- **Corrupt metadata in one row** degrades to `{ _corrupt: true }` for that row
+  only; it never wipes a result set.
+- **All user values are parameterized.** LIKE wildcards (`% _ \`) are escaped.
+- **Vectors** are bound as little-endian float32 `Buffer`s; vec0 primary keys as
+  `BigInt`.
+- **Consolidation never deletes.** Superseding is reversible and reported.
+- **Unfiltered bulk deletes refused.** `VACUUM INTO` destination must not contain
+  single quotes.
+- **Search failures throw** (the handler surfaces an error) rather than silently
+  returning `[]` — you can tell "no matches" from "something broke".
+- **`npm test` runs against a temp DB** in the OS temp dir; it can't touch the
+  user's real memory.
 
 ---
 
 ## Files
 
 ```
-durandal-mcp-server-v3.js     main entry: MCP server + CLI commands
-db-adapter.js                 thin facade over MCPDatabaseClient
-mcp-db-client.js              SQLite + FTS5 + all DB primitives
-logger.js                     stderr-only console, JSON-lines file, rotation
-errors.js                     MCPError + subclasses + SQLITE-code-aware recovery hints
-test-runner.js                `npm test` — 9 isolated unit tests
-test-mcp-smoke.js             end-to-end stdio JSON-RPC test, ~32 scenarios
-update-checker.js             npm-registry polling, stderr-routed notifications
-db-discovery.js               `--discover` — filesystem search for legacy DBs
-db-migrate.js                 `--migrate` — merges multiple DBs into the canonical one
-assign-projects.js            CLI: retroactively label orphaned memories
-.env.mcp-minimal              example config template
-mcp-bundle.json               MCP metadata for bundler discovery
-legacy/                       pre-v3 app, design docs, old integration tests — not in the npm package
+durandal-mcp-server.js   main entry: MCP server + CLI commands
+db.js                    MemoryDB: better-sqlite3 + FTS5 + sqlite-vec, hybrid search, consolidation
+embeddings.js            local embedding provider (transformers.js, lazy singleton, graceful)
+logger.js                stderr-only console, JSON-lines file, rotation
+errors.js                MCPError + subclasses + SQLITE-code-aware recovery hints
+update-checker.js        npm-registry polling, stderr-routed
+test-runner.js           `npm test` — behavioural unit tests (incl. semantic recall)
+test-mcp-smoke.js        end-to-end stdio JSON-RPC test, ~32 scenarios
+db-discovery.js          --discover: filesystem search for legacy DBs
+db-migrate.js            --migrate: merge multiple DBs into the canonical one
+assign-projects.js       CLI: retroactively label orphaned memories
+legacy/                  pre-v4 app + the removed RAMR cache — not in the npm package
 ```
 
 ---
 
-## Testing
+## Dependencies
 
-Two layers, both runnable with zero external setup.
+| Package | Why |
+|---|---|
+| `@modelcontextprotocol/sdk` | MCP server/transport |
+| `better-sqlite3`            | Synchronous SQLite (replaces node-sqlite3; first-class extension loading) |
+| `sqlite-vec`                | Vector search (`vec0`) inside the same SQLite file |
+| `@huggingface/transformers` | Local CPU embeddings (all-MiniLM-L6-v2), no API |
 
-**`npm test`** (`test-runner.js`): 9 unit tests. Points `DATABASE_PATH` at a fresh file in OS temp dir for isolation, cleans up (incl. `-wal`/`-shm` siblings) at the end. Covers DB connection, schema, store/search/recent, cache, MCP tool registry, error types, perf sanity.
-
-**`node test-mcp-smoke.js`**: spawns the server as a subprocess, speaks raw JSON-RPC over stdin/stdout, verifies ~32 scenarios. Catches things unit tests can't: stdout pollution, Zod validation surfaces, structuredContent shape, FTS tokenization, LIKE-escape, resource/prompt registration, new-tool round-trips (`find_similar`, `tag_memory`, `backup_database`, etc.).
+Requires Node ≥ 20 (better-sqlite3 prebuilt binaries).
 
 ---
 
 ## Not in scope
 
-Things deliberately absent:
-
-- **No cross-process sync.** One server, one DB file. Multiple instances on the same file will rely on SQLite locking.
-- **No retention policy.** DB grows until you run `delete_memories_where` or `delete_memory`. No TTL, no auto-purge.
-- **No embedding-based semantic search.** FTS5 + BM25 is lexical. "react" and "React.js" both match; "frontend framework" won't match "react" automatically.
-- **No multi-tenant isolation.** Metadata has a `project` field but the DB is shared. Use separate `DATABASE_PATH` per tenant if you need hard isolation.
-- **No HTTP transport.** Stdio only. Adding SSE/streamable-HTTP would be a small change (SDK ships transports) but hasn't been done.
+- **No LLM in the write path.** Consolidation is near-duplicate detection, not
+  LLM-judged contradiction resolution. Storage stays verbatim, deterministic,
+  and free of extraction errors.
+- **No cross-process sync.** One server, one DB file; multiple instances rely on
+  SQLite/WAL locking.
+- **No TTL / auto-purge.** Superseded rows are retained until explicitly deleted.
+- **No HTTP transport.** Stdio only.
+- **No reranker.** The hybrid pipeline is BM25 ⊕ vector via RRF; a cross-encoder
+  reranking stage is a possible future addition.
+```

@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
+const Database = require('better-sqlite3');
 
 class DatabaseDiscovery {
     constructor() {
@@ -177,61 +178,56 @@ class DatabaseDiscovery {
     }
 
     async verifyDatabase(dbPath) {
+        let db;
         try {
-            const sqlite3 = require('sqlite3').verbose();
+            // Open strictly read-only — discovery must never create or modify a database.
+            db = new Database(dbPath, { readonly: true, fileMustExist: true });
 
-            return new Promise((resolve) => {
-                const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (err) => {
-                    if (err) {
-                        resolve({ valid: false, error: err.message });
-                        return;
+            // Check if it has the memories table
+            const row = db.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+            ).get();
+
+            if (row) {
+                // Count records
+                try {
+                    const countRow = db.prepare("SELECT COUNT(*) as count FROM memories").get();
+                    if (countRow) {
+                        return {
+                            valid: true,
+                            hasDurandalSchema: true,
+                            recordCount: countRow.count
+                        };
                     }
-
-                    // Check if it has the memories table
-                    db.get(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'",
-                        (err, row) => {
-                            if (err) {
-                                db.close();
-                                resolve({ valid: false, error: err.message });
-                            } else if (row) {
-                                // Count records
-                                db.get("SELECT COUNT(*) as count FROM memories", (err2, countRow) => {
-                                    db.close();
-                                    if (!err2 && countRow) {
-                                        resolve({
-                                            valid: true,
-                                            hasDurandalSchema: true,
-                                            recordCount: countRow.count
-                                        });
-                                    } else {
-                                        resolve({
-                                            valid: true,
-                                            hasDurandalSchema: true,
-                                            recordCount: 0
-                                        });
-                                    }
-                                });
-                            } else {
-                                // Check for legacy tables
-                                db.get(
-                                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('projects', 'conversation_sessions', 'conversation_messages')",
-                                    (err3, legacyRow) => {
-                                        db.close();
-                                        resolve({
-                                            valid: true,
-                                            hasDurandalSchema: !!legacyRow,
-                                            isLegacy: !!legacyRow
-                                        });
-                                    }
-                                );
-                            }
-                        }
-                    );
-                });
-            });
+                    return {
+                        valid: true,
+                        hasDurandalSchema: true,
+                        recordCount: 0
+                    };
+                } catch (e2) {
+                    return {
+                        valid: true,
+                        hasDurandalSchema: true,
+                        recordCount: 0
+                    };
+                }
+            } else {
+                // Check for legacy tables
+                const legacyRow = db.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('projects', 'conversation_sessions', 'conversation_messages')"
+                ).get();
+                return {
+                    valid: true,
+                    hasDurandalSchema: !!legacyRow,
+                    isLegacy: !!legacyRow
+                };
+            }
         } catch (e) {
-            return { valid: false, error: 'SQLite not available' };
+            return { valid: false, error: e.message };
+        } finally {
+            if (db) {
+                try { db.close(); } catch (e) { /* ignore */ }
+            }
         }
     }
 

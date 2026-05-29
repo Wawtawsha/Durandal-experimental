@@ -10,7 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');
 const DatabaseDiscovery = require('./db-discovery');
 
 class DatabaseMigrator {
@@ -36,50 +36,43 @@ class DatabaseMigrator {
             fs.mkdirSync(dir, { recursive: true });
         }
 
-        return new Promise((resolve, reject) => {
-            this.targetDb = new sqlite3.Database(this.targetPath, (err) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
+        // Open (creating if needed) the target database. Throws on failure.
+        this.targetDb = new Database(this.targetPath);
 
-                // Create schema - handle existing table by adding columns if needed
-                const createTable = `
-                    CREATE TABLE IF NOT EXISTS memories (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        content TEXT NOT NULL,
-                        metadata TEXT,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                    );
+        // Create schema - handle existing table by adding columns if needed
+        const createTable = `
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                metadata TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
 
-                    CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
-                `;
+            CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+        `;
 
-                this.targetDb.exec(createTable, (err) => {
-                    if (err) {
-                        reject(err);
-                        return;
-                    }
+        this.targetDb.exec(createTable);
 
-                    // Try to add migration columns if they don't exist
-                    this.targetDb.run('ALTER TABLE memories ADD COLUMN source_db TEXT', (err) => {
-                        // Ignore error if column already exists
-                        this.targetDb.run('ALTER TABLE memories ADD COLUMN original_id INTEGER', (err2) => {
-                            // Create indices
-                            const indices = `
-                                CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source_db, original_id);
-                                CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(
-                                    substr(content, 1, 100)
-                                );
-                            `;
-                            this.targetDb.exec(indices, (err3) => {
-                                resolve();
-                            });
-                        });
-                    });
-                });
-            });
-        });
+        // Try to add migration columns if they don't exist (ignore error if they do)
+        try {
+            this.targetDb.exec('ALTER TABLE memories ADD COLUMN source_db TEXT');
+        } catch (e) {
+            // Ignore error if column already exists
+        }
+        try {
+            this.targetDb.exec('ALTER TABLE memories ADD COLUMN original_id INTEGER');
+        } catch (e) {
+            // Ignore error if column already exists
+        }
+
+        // Create indices
+        const indices = `
+            CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source_db, original_id);
+            CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(
+                substr(content, 1, 100)
+            );
+        `;
+        this.targetDb.exec(indices);
     }
 
     /**
@@ -111,23 +104,19 @@ class DatabaseMigrator {
     }
 
     /**
-     * Check for duplicate memory based on content
+     * Check for duplicate memory based on content.
+     * Synchronous so it can run inside a better-sqlite3 transaction.
      */
-    async isDuplicate(content, metadata) {
-        return new Promise((resolve) => {
-            // Check for exact content match
-            this.targetDb.get(
-                'SELECT id FROM memories WHERE content = ? LIMIT 1',
-                [content],
-                (err, row) => {
-                    if (err) {
-                        resolve(false);
-                    } else {
-                        resolve(!!row);
-                    }
-                }
-            );
-        });
+    isDuplicate(content, metadata) {
+        // Check for exact content match
+        try {
+            const row = this.targetDb.prepare(
+                'SELECT id FROM memories WHERE content = ? LIMIT 1'
+            ).get(content);
+            return !!row;
+        } catch (err) {
+            return false;
+        }
     }
 
     /**
@@ -137,84 +126,79 @@ class DatabaseMigrator {
         console.log(`\nMigrating from: ${sourceDb.path}`);
         console.log(`Records to migrate: ${sourceDb.recordCount}`);
 
-        return new Promise((resolve) => {
-            const source = new sqlite3.Database(sourceDb.path, sqlite3.OPEN_READONLY, async (err) => {
-                if (err) {
-                    console.error(`  Error opening source: ${err.message}`);
-                    this.stats.errors++;
-                    resolve();
-                    return;
+        // Open source strictly read-only — migration must never modify source data.
+        let source;
+        try {
+            source = new Database(sourceDb.path, { readonly: true, fileMustExist: true });
+        } catch (err) {
+            console.error(`  Error opening source: ${err.message}`);
+            this.stats.errors++;
+            return;
+        }
+
+        let rows;
+        try {
+            // Get all memories from source
+            rows = source.prepare('SELECT * FROM memories ORDER BY created_at').all();
+        } catch (err) {
+            console.error(`  Error reading memories: ${err.message}`);
+            this.stats.errors++;
+            source.close();
+            return;
+        }
+
+        let migrated = 0;
+        let duplicates = 0;
+
+        const insert = this.targetDb.prepare(
+            `INSERT INTO memories (content, metadata, created_at, source_db, original_id)
+             VALUES (?, ?, ?, ?, ?)`
+        );
+
+        // Wrap the per-source writes in a single transaction for safety and speed.
+        const migrateRows = this.targetDb.transaction(() => {
+            for (const row of rows) {
+                this.stats.totalMemories++;
+
+                // Check for duplicate
+                const isDupe = this.isDuplicate(row.content, row.metadata);
+
+                if (isDupe) {
+                    duplicates++;
+                    this.stats.duplicates++;
+                    continue;
                 }
 
-                // Get all memories from source
-                source.all(
-                    'SELECT * FROM memories ORDER BY created_at',
-                    async (err, rows) => {
-                        if (err) {
-                            console.error(`  Error reading memories: ${err.message}`);
-                            this.stats.errors++;
-                            source.close();
-                            resolve();
-                            return;
-                        }
-
-                        let migrated = 0;
-                        let duplicates = 0;
-
-                        for (const row of rows) {
-                            this.stats.totalMemories++;
-
-                            // Check for duplicate
-                            const isDupe = await this.isDuplicate(row.content, row.metadata);
-
-                            if (isDupe) {
-                                duplicates++;
-                                this.stats.duplicates++;
-                                continue;
-                            }
-
-                            // Migrate the memory
-                            await new Promise((migrateResolve) => {
-                                this.targetDb.run(
-                                    `INSERT INTO memories (content, metadata, created_at, source_db, original_id)
-                                     VALUES (?, ?, ?, ?, ?)`,
-                                    [
-                                        row.content,
-                                        row.metadata,
-                                        row.created_at || new Date().toISOString(),
-                                        sourceDb.path,
-                                        row.id
-                                    ],
-                                    (err) => {
-                                        if (err) {
-                                            if (!err.message.includes('UNIQUE constraint')) {
-                                                console.error(`  Migration error: ${err.message}`);
-                                                this.stats.errors++;
-                                            } else {
-                                                duplicates++;
-                                                this.stats.duplicates++;
-                                            }
-                                        } else {
-                                            migrated++;
-                                            this.stats.migrated++;
-                                        }
-                                        migrateResolve();
-                                    }
-                                );
-                            });
-                        }
-
-                        console.log(`  ✓ Migrated: ${migrated} memories`);
-                        if (duplicates > 0) {
-                            console.log(`  ⚠ Skipped: ${duplicates} duplicates`);
-                        }
-
-                        source.close();
-                        resolve();
+                // Migrate the memory
+                try {
+                    insert.run(
+                        row.content,
+                        row.metadata,
+                        row.created_at || new Date().toISOString(),
+                        sourceDb.path,
+                        row.id
+                    );
+                    migrated++;
+                    this.stats.migrated++;
+                } catch (err) {
+                    if (!err.message.includes('UNIQUE constraint')) {
+                        console.error(`  Migration error: ${err.message}`);
+                        this.stats.errors++;
+                    } else {
+                        duplicates++;
+                        this.stats.duplicates++;
                     }
-                );
-            });
+                }
+            }
         });
+        migrateRows();
+
+        console.log(`  ✓ Migrated: ${migrated} memories`);
+        if (duplicates > 0) {
+            console.log(`  ⚠ Skipped: ${duplicates} duplicates`);
+        }
+
+        source.close();
     }
 
     /**
@@ -284,14 +268,14 @@ class DatabaseMigrator {
             }
 
             // Get final count
-            await new Promise((resolve) => {
-                this.targetDb.get('SELECT COUNT(*) as count FROM memories', (err, row) => {
-                    if (!err && row) {
-                        console.log(`\n✅ Universal database now contains: ${row.count} memories`);
-                    }
-                    resolve();
-                });
-            });
+            try {
+                const row = this.targetDb.prepare('SELECT COUNT(*) as count FROM memories').get();
+                if (row) {
+                    console.log(`\n✅ Universal database now contains: ${row.count} memories`);
+                }
+            } catch (e) {
+                // Ignore count error
+            }
 
             console.log(`\nUniversal database location:`);
             console.log(`  ${this.targetPath}`);
@@ -326,18 +310,17 @@ class DatabaseMigrator {
         console.log('\nVerifying migration integrity...');
 
         // Count memories in target
-        return new Promise((resolve) => {
-            this.targetDb.get(
-                'SELECT COUNT(*) as count, COUNT(DISTINCT source_db) as sources FROM memories',
-                (err, row) => {
-                    if (!err && row) {
-                        console.log(`  Memories in universal DB: ${row.count}`);
-                        console.log(`  Migrated from ${row.sources} source(s)`);
-                    }
-                    resolve();
-                }
-            );
-        });
+        try {
+            const row = this.targetDb.prepare(
+                'SELECT COUNT(*) as count, COUNT(DISTINCT source_db) as sources FROM memories'
+            ).get();
+            if (row) {
+                console.log(`  Memories in universal DB: ${row.count}`);
+                console.log(`  Migrated from ${row.sources} source(s)`);
+            }
+        } catch (e) {
+            // Ignore verification error
+        }
     }
 }
 

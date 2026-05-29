@@ -20,7 +20,7 @@ const EventEmitter = require('events');
 const fs = require('fs');
 const path = require('path');
 
-const DatabaseAdapter = require('./db-adapter');
+const MemoryDB = require('./db');
 const Logger = require('./logger');
 const {
     MCPError,
@@ -110,7 +110,7 @@ class DurandalMCPServer extends EventEmitter {
             }
         });
 
-        this.db = new DatabaseAdapter();
+        this.db = new MemoryDB();
 
         this.ready = this.runDatabaseStartupCheck();
         this.registerTools();
@@ -294,7 +294,7 @@ class DurandalMCPServer extends EventEmitter {
 
         R('store_memory', {
             title: 'Store Memory',
-            description: 'Store a piece of information so Claude can recall it in a future session. Content is indexed by project and session in metadata.',
+            description: 'Store a piece of information so Claude can recall it in a future session. Content is indexed for both lexical (BM25) and semantic (embedding) search. If the new memory is a near-duplicate of an existing one in the same project, the older one is automatically superseded (hidden from results but not deleted) and reported in the response.',
             inputSchema: {
                 content: z.string().min(1).max(50000).describe('The text to remember'),
                 metadata: metadataSchema.optional().describe('Optional tagging/categorization metadata')
@@ -304,7 +304,8 @@ class DurandalMCPServer extends EventEmitter {
                 project: z.string(),
                 session: z.string(),
                 importance: z.number().nullable(),
-                categories: z.array(z.string())
+                categories: z.array(z.string()),
+                superseded: z.number().int().nullable().describe('Id of a near-duplicate memory this one replaced, or null')
             },
             annotations: {
                 readOnlyHint: false,
@@ -316,18 +317,20 @@ class DurandalMCPServer extends EventEmitter {
 
         R('search_memories', {
             title: 'Search Memories',
-            description: 'Full-text search over stored memories with BM25 relevance ranking. The query is tokenized on whitespace and all tokens must match (implicit AND). Results can be filtered by project/session/categories/importance range. Falls back to substring search if the query tokenizes to nothing.',
+            description: 'Hybrid search over stored memories: lexical full-text (BM25) and semantic (embedding similarity) candidates are fused with Reciprocal Rank Fusion. Lexical catches exact tokens (identifiers, error strings); semantic catches paraphrase ("build broken" finds "compilation failing"). Falls back to lexical-only, then substring, if embeddings are unavailable. Filterable by project/session/categories/importance. Superseded (consolidated) memories are excluded.',
             inputSchema: {
-                query: z.string().min(1).describe('Search query. Tokens are AND-ed; "react typescript" matches rows with both words.'),
+                query: z.string().min(1).describe('Natural-language or keyword query. Matched both lexically and semantically.'),
                 filters: filtersSchema.optional(),
                 limit: z.number().int().min(1).max(100).optional().default(10)
             },
             outputSchema: {
                 count: z.number().int(),
-                total: z.number().int().describe('Total matches across the database for this query+filters (before limit).'),
+                total: z.number().int().describe('Lexical (FTS) matches passing the filters; semantic neighbours may add related results within the returned set.'),
                 results: z.array(memoryRowSchema.extend({
-                    relevance: z.number().nullable(),
-                    snippet: z.string().nullable()
+                    relevance: z.number().nullable().describe('Fused RRF score (higher = more relevant)'),
+                    snippet: z.string().nullable(),
+                    distance: z.number().nullable().optional().describe('Cosine distance from the query (lower = closer), if matched semantically'),
+                    signals: z.array(z.string()).optional().describe('Which signals matched: "lexical", "semantic", or "substring"')
                 }))
             },
             annotations: { readOnlyHint: true, openWorldHint: false }
@@ -518,7 +521,7 @@ class DurandalMCPServer extends EventEmitter {
 
         R('find_similar', {
             title: 'Find Similar Memories',
-            description: 'Find memories similar to the given one using FTS5 (token-overlap with BM25 ranking, OR-of-tokens). Excludes the source memory.',
+            description: 'Find memories semantically similar to the given one using embedding similarity (cosine KNN), excluding the source and any superseded memories. Falls back to FTS token-overlap if embeddings are unavailable.',
             inputSchema: {
                 id: z.number().int().positive(),
                 limit: z.number().int().min(1).max(50).optional().default(5)
@@ -527,7 +530,8 @@ class DurandalMCPServer extends EventEmitter {
                 source_id: z.number().int(),
                 count: z.number().int(),
                 results: z.array(memoryRowSchema.extend({
-                    relevance: z.number().nullable().optional()
+                    relevance: z.number().nullable().optional(),
+                    distance: z.number().nullable().optional()
                 }))
             },
             annotations: { readOnlyHint: true, openWorldHint: false }
@@ -679,10 +683,15 @@ class DurandalMCPServer extends EventEmitter {
             );
         }
         const memoryId = dbResult.id;
+        const supersededId = dbResult.supersededId ?? null;
 
         this.logger.success(`Memory stored (id: ${memoryId})`, {
-            requestId, memoryId, contentLength: content.length, importance: enriched.importance
+            requestId, memoryId, contentLength: content.length, importance: enriched.importance, supersededId
         });
+
+        const supersededLine = supersededId
+            ? `\n**Consolidated:** superseded near-duplicate memory #${supersededId} (hidden from results, not deleted)`
+            : '';
 
         return {
             content: [{
@@ -692,14 +701,16 @@ class DurandalMCPServer extends EventEmitter {
                       `**Project:** ${enriched.project}\n` +
                       `**Session:** ${enriched.session}\n` +
                       `**Importance:** ${enriched.importance ?? 'Not set'}\n` +
-                      `**Categories:** ${enriched.categories?.join(', ') || 'None'}`
+                      `**Categories:** ${enriched.categories?.join(', ') || 'None'}` +
+                      supersededLine
             }],
             structuredContent: {
                 id: memoryId,
                 project: enriched.project,
                 session: enriched.session,
                 importance: enriched.importance ?? null,
-                categories: enriched.categories || []
+                categories: enriched.categories || [],
+                superseded: supersededId
             }
         };
     }
@@ -708,50 +719,39 @@ class DurandalMCPServer extends EventEmitter {
         this.logger.processing('Processing search_memories request from Claude');
         const { query, filters = {}, limit = 10 } = args;
 
-        this.logger.substep('Querying database');
-        const [dbResults, total] = await Promise.all([
-            this.db.searchMemories(query, {
-                project: filters.project,
-                session: filters.session,
-                limit: limit * 2 // over-fetch so post-filters trim without starving results
-            }),
-            this.db.countSearchMatches(query, { project: filters.project, session: filters.session })
-        ]);
-
-        const filtered = dbResults.filter((r) => {
-            const m = r.metadata || {};
-            if (filters.importance_min !== undefined && (m.importance ?? 0) < filters.importance_min) return false;
-            if (filters.importance_max !== undefined && (m.importance ?? 0) > filters.importance_max) return false;
-            if (filters.categories && filters.categories.length) {
-                const cats = new Set(m.categories || []);
-                if (!filters.categories.some(c => cats.has(c))) return false;
-            }
-            return true;
-        }).slice(0, limit);
-
-        this.logger.success(`Search completed (${filtered.length} results)`, {
-            requestId, query, resultsCount: filtered.length
+        this.logger.substep('Querying database (hybrid: lexical + semantic)');
+        const { results, total } = await this.db.searchMemories(query, {
+            project: filters.project,
+            session: filters.session,
+            categories: filters.categories,
+            importance_min: filters.importance_min,
+            importance_max: filters.importance_max,
+            limit
         });
 
-        if (!filtered.length) {
+        this.logger.success(`Search completed (${results.length} results)`, {
+            requestId, query, resultsCount: results.length
+        });
+
+        if (!results.length) {
             return {
                 content: [{ type: 'text', text: 'No memories found matching your query.' }],
                 structuredContent: { count: 0, total, results: [] }
             };
         }
 
-        // Results come back ranked by FTS BM25 when possible, so position i=0
-        // is the best match. We don't print raw BM25 scores — they're negative
-        // and un-normalized, so the number is meaningless to humans. When FTS
-        // fired we use its snippet() output (16-token window around the match
-        // with matched tokens wrapped in ** ** for client highlighting);
-        // otherwise we fall back to a simple content prefix.
-        const formatted = filtered.map((r, i) => {
+        // Results are ranked by fused RRF score (lexical BM25 + semantic cosine),
+        // best first. We surface the snippet() highlight when the lexical signal
+        // fired, and tag each result with which signals matched so the value of
+        // semantic recall is visible. Raw scores aren't printed — they're only
+        // meaningful relative to each other.
+        const formatted = results.map((r, i) => {
             const m = r.metadata || {};
             const body = r.snippet
                 ? r.snippet
                 : (r.content.length > 100 ? r.content.slice(0, 100) + '...' : r.content);
-            return `**${i + 1}. Memory ${r.id}**\n` +
+            const how = r.signals?.length ? ` _(${r.signals.join('+')})_` : '';
+            return `**${i + 1}. Memory ${r.id}**${how}\n` +
                    `   ${body}\n` +
                    `   Project: ${m.project || 'None'}\n` +
                    `   Session: ${m.session || 'None'}\n` +
@@ -760,20 +760,20 @@ class DurandalMCPServer extends EventEmitter {
                    `   Created: ${r.created_at || 'Unknown'}`;
         }).join('\n\n');
 
-        // Total = matches across the whole DB (so client can show "showing
-        // N of M" pagination). count = rows actually returned in this slice.
         return {
-            content: [{ type: 'text', text: `**Search Results** (${filtered.length} of ${total} matches)\n\n${formatted}` }],
+            content: [{ type: 'text', text: `**Search Results** (${results.length} shown; ${total} lexical matches)\n\n${formatted}` }],
             structuredContent: {
-                count: filtered.length,
+                count: results.length,
                 total,
-                results: filtered.map(r => ({
+                results: results.map(r => ({
                     id: r.id,
                     content: r.content,
                     metadata: r.metadata,
                     created_at: r.created_at,
                     relevance: r.relevance ?? null,
-                    snippet: r.snippet ?? null
+                    snippet: r.snippet ?? null,
+                    distance: r.distance ?? null,
+                    signals: r.signals ?? []
                 }))
             }
         };
@@ -919,6 +919,7 @@ class DurandalMCPServer extends EventEmitter {
                 sessionCount: dbSessionCount,
                 ftsEnabled: this.db.ftsAvailable
             },
+            embeddings: this.db.embeddingInfo(),
             logging: {
                 consoleLevel: this.logger.getConsoleLevel(),
                 fileLevel: this.logger.getFileLevel(),
@@ -944,6 +945,11 @@ class DurandalMCPServer extends EventEmitter {
         output += `┃  Stored Memories: ${(statusData.database.memoryCount + ' memories').padEnd(35)}┃\n`;
         output += `┃  Projects:        ${(statusData.database.projectCount + ' projects').padEnd(35)}┃\n`;
         output += `┃  Sessions:        ${(statusData.database.sessionCount + ' sessions').padEnd(35)}┃\n`;
+        output += '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n';
+        const emb = statusData.embeddings;
+        const embLine = emb.available ? `[OK] ${emb.model}` : '[OFF] lexical-only';
+        output += `┃  Semantic Search: ${embLine.slice(0, 35).padEnd(35)}┃\n`;
+        output += `┃  Vectors Indexed: ${(emb.vectorCount + ' vectors').padEnd(35)}┃\n`;
         output += '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n';
         output += `┃  Console Level:   ${statusData.logging.consoleLevel.padEnd(35)}┃\n`;
         output += `┃  File Level:      ${statusData.logging.fileLevel.padEnd(35)}┃\n`;
@@ -1500,14 +1506,9 @@ class DurandalMCPServer extends EventEmitter {
         this.logger.info('[STOP] Shutting down Durandal MCP Server');
         try { await this.ready; } catch (_) {}
 
-        try {
-            const client = this.db?.db?.client;
-            if (client) {
-                await new Promise((resolve) => client.exec('PRAGMA wal_checkpoint(TRUNCATE)', () => resolve()));
-            }
-        } catch (_) {}
+        try { this.db?.checkpoint?.(); } catch (_) {}
 
-        if (this.db?.close) await this.db.close();
+        if (this.db?.close) this.db.close();
         this.logger.close();
         setTimeout(() => process.exit(0), 50);
     }
@@ -1525,7 +1526,7 @@ class DurandalMCPServer extends EventEmitter {
         }
         if (args.includes('--version') || args.includes('-v')) {
             const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
-            process.stdout.write(`\nDurandal MCP Server\nVersion: ${pkg.version}\nNode.js: ${process.version}\nPlatform: ${process.platform} ${process.arch}\nMCP SDK: ${pkg.dependencies['@modelcontextprotocol/sdk']}\nSQLite3: ${pkg.dependencies.sqlite3}\n`);
+            process.stdout.write(`\nDurandal MCP Server\nVersion: ${pkg.version}\nNode.js: ${process.version}\nPlatform: ${process.platform} ${process.arch}\nMCP SDK: ${pkg.dependencies['@modelcontextprotocol/sdk']}\nbetter-sqlite3: ${pkg.dependencies['better-sqlite3']}\nsqlite-vec: ${pkg.dependencies['sqlite-vec']}\nEmbeddings: ${pkg.dependencies['@huggingface/transformers']} (local, all-MiniLM-L6-v2)\n`);
             process.exit(0);
         }
         if (args.includes('--test')) {
@@ -1623,7 +1624,7 @@ class DurandalMCPServer extends EventEmitter {
 
 function helpText() {
     return `
-Durandal MCP Server v3 - Zero-config AI memory system for Claude Code
+Durandal MCP Server v4 - Zero-config AI memory for Claude Code (hybrid lexical + semantic)
 
 Usage: durandal-mcp [options]
 
@@ -1666,27 +1667,21 @@ function formatUptime(seconds) {
 
 async function statusCliCommand() {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
-    const MCPDatabaseClient = require('./mcp-db-client');
-    const tempClient = new MCPDatabaseClient();
+    const MemoryDB = require('./db');
+    const tempClient = new MemoryDB();
     const dbPath = tempClient.dbPath;
     const dbExists = fs.existsSync(dbPath);
 
     let memoryCount = 0, projectCount = 0, sessionCount = 0;
     if (dbExists) {
         try {
-            const countResult = await tempClient.query('SELECT COUNT(*) as count FROM memories');
-            memoryCount = countResult.rows[0]?.count || 0;
-            const projectResult = await tempClient.query(
-                "SELECT COUNT(DISTINCT json_extract(metadata, '$.project')) as count FROM memories WHERE json_extract(metadata, '$.project') IS NOT NULL"
-            );
-            projectCount = projectResult.rows[0]?.count || 0;
-            const sessionResult = await tempClient.query(
-                "SELECT COUNT(DISTINCT json_extract(metadata, '$.session')) as count FROM memories WHERE json_extract(metadata, '$.session') IS NOT NULL"
-            );
-            sessionCount = sessionResult.rows[0]?.count || 0;
+            const s = tempClient.stats();
+            memoryCount = s.total;
+            projectCount = s.projects;
+            sessionCount = s.sessions;
         } catch (_) {}
     }
-    await tempClient.close();
+    tempClient.close();
 
     const data = {
         version: pkg.version,

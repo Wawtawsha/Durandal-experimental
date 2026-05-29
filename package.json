@@ -1,18 +1,18 @@
 {
   "name": "durandal-memory-mcp",
-  "version": "3.2.5",
-  "description": "Durandal MCP Server - Zero-config AI memory system for Claude Code. Persistent, searchable memory with automatic SQLite setup.",
-  "main": "durandal-mcp-server-v3.js",
+  "version": "4.0.0",
+  "description": "Durandal MCP Server - Zero-config AI memory for Claude Code. Hybrid lexical + semantic search (SQLite FTS5 + local embeddings), with write-time consolidation. Local-only, no API keys.",
+  "main": "durandal-mcp-server.js",
   "bin": {
-    "durandal-mcp": "durandal-mcp-server-v3.js",
+    "durandal-mcp": "durandal-mcp-server.js",
     "durandal-assign-projects": "assign-projects.js",
     "durandal-migrate": "db-migrate.js",
     "durandal-discover": "db-discovery.js"
   },
   "files": [
-    "durandal-mcp-server-v3.js",
-    "db-adapter.js",
-    "mcp-db-client.js",
+    "durandal-mcp-server.js",
+    "db.js",
+    "embeddings.js",
     "db-discovery.js",
     "db-migrate.js",
     "assign-projects.js",
@@ -28,8 +28,9 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "start": "node durandal-mcp-server-v3.js",
-    "test": "node durandal-mcp-server-v3.js --test"
+    "start": "node durandal-mcp-server.js",
+    "test": "node durandal-mcp-server.js --test",
+    "test:smoke": "node test-mcp-smoke.js"
   },
   "keywords": [
     "mcp",
@@ -41,16 +42,22 @@
     "sqlite",
     "zero-config",
     "memory-server",
-    "semantic-search"
+    "semantic-search",
+    "hybrid-search",
+    "vector-search",
+    "embeddings",
+    "rag"
   ],
   "author": "Enterprise Data and Analytics",
   "license": "MIT",
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "sqlite3": "^6.0.1"
+    "better-sqlite3": "12.10.0",
+    "sqlite-vec": "0.1.9"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "repository": {
     "type": "git",

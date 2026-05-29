@@ -80,6 +80,21 @@ function rrfFuse(lists, K = RRF_K) {
     return [...scores.entries()].sort((a, b) => b[1] - a[1]);
 }
 
+// Dot product. Our embeddings are L2-normalized, so dot == cosine similarity.
+function dot(a, b) {
+    let s = 0;
+    for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+    return s;
+}
+
+// Copy a sqlite-vec BLOB (Buffer) into a fresh, 4-byte-aligned Float32Array.
+// (Node Buffers are views into pooled ArrayBuffers at arbitrary offsets, so we
+// slice out an exact, aligned copy before constructing the typed array.)
+function blobToF32(buf) {
+    const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    return new Float32Array(ab);
+}
+
 class MemoryDB {
     constructor(opts = {}) {
         this.dbPath = opts.dbPath || process.env.DATABASE_PATH || this.resolveDatabasePath();
@@ -597,6 +612,69 @@ class MemoryDB {
             }
         }
         return [];
+    }
+
+    // Surface clusters of semantically-similar ACTIVE memories (same project) for
+    // the CLIENT to review and resolve — duplicates, updates, or contradictions
+    // that are too far apart for automatic near-duplicate consolidation. Read-only:
+    // it suggests candidates, it never merges. Reuses stored embeddings (no
+    // re-embedding) and scans the most recent `scan` active memories in scope so
+    // it stays fast on large stores.
+    async suggestConsolidations({ project = null, threshold = 0.6, limit = 10, scan = 300 } = {}) {
+        if (!this.vecAvailable || !this.embedder.available) {
+            return { available: false, scanned: 0, groups: [] };
+        }
+        let sql = `SELECT m.id, m.content, m.metadata, m.created_at
+                   FROM memories m JOIN vec_memories v ON v.memory_id = m.id
+                   WHERE m.superseded_by IS NULL`;
+        const params = [];
+        if (project) { sql += " AND json_extract(m.metadata, '$.project') = ?"; params.push(project); }
+        sql += ' ORDER BY m.created_at DESC LIMIT ?';
+        params.push(scan);
+        const rows = this.db.prepare(sql).all(...params).map(r => this._parseRow(r));
+        if (rows.length < 2) return { available: true, scanned: rows.length, groups: [] };
+
+        // Load each memory's stored embedding once.
+        const vecStmt = this.db.prepare('SELECT embedding FROM vec_memories WHERE memory_id = ?');
+        const vectors = new Map();
+        for (const r of rows) {
+            const blob = vecStmt.get(r.id)?.embedding;
+            if (blob) vectors.set(r.id, blobToF32(blob));
+        }
+
+        // Greedy single-link clustering within the same project. Normalized
+        // vectors => dot product is cosine similarity.
+        const assigned = new Set();
+        const groups = [];
+        for (const r of rows) {
+            if (assigned.has(r.id) || !vectors.has(r.id)) continue;
+            const base = vectors.get(r.id);
+            const rProject = this._project(r.metadata);
+            const members = [r];
+            assigned.add(r.id);
+            for (const other of rows) {
+                if (assigned.has(other.id) || !vectors.has(other.id)) continue;
+                if (this._project(other.metadata) !== rProject) continue;
+                if (dot(base, vectors.get(other.id)) >= threshold) {
+                    members.push(other);
+                    assigned.add(other.id);
+                }
+            }
+            if (members.length >= 2) {
+                groups.push({
+                    project: rProject,
+                    size: members.length,
+                    memories: members.map(m => ({
+                        id: m.id,
+                        content: m.content,
+                        created_at: m.created_at,
+                        importance: m.metadata?.importance ?? null
+                    }))
+                });
+                if (groups.length >= limit) break;
+            }
+        }
+        return { available: true, scanned: rows.length, groups };
     }
 
     // -------------------------------------------------------------------------

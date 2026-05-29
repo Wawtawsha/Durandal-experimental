@@ -26,7 +26,7 @@ Add to Claude Code: `claude mcp add durandal-memory -- cmd /c durandal-mcp`
 
 ## Architecture
 
-- **`durandal-mcp-server.js`** — MCP server: registers 20 tools (Zod-validated),
+- **`durandal-mcp-server.js`** — MCP server: registers 21 tools (Zod-validated),
   resources, and a prompt; `wrapHandler` does uniform logging + error wrapping +
   MCP log notifications; also the admin CLI (`--test`, `--status`, etc.).
 - **`db.js` (`MemoryDB`)** — the engine. better-sqlite3 (synchronous) + FTS5 +

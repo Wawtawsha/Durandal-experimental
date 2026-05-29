@@ -80,8 +80,9 @@ class TestRunner {
         await this.runTest('Semantic recall is project-scoped', this.testSemanticScoped.bind(this));
         await this.runTest('Filters applied in SQL + filter-aware total', this.testFilters.bind(this));
         await this.runTest('find_similar', this.testFindSimilar.bind(this));
+        await this.runTest('suggest_consolidations (client-driven)', this.testSuggestConsolidations.bind(this));
         await this.runTest('Graceful degradation (embeddings off)', this.testDegradation.bind(this));
-        await this.runTest('MCP tool registry (20 tools)', this.testMCPTools.bind(this));
+        await this.runTest('MCP tool registry (21 tools)', this.testMCPTools.bind(this));
         await this.runTest('Error types + clean not-found', this.testErrors.bind(this));
         await this.runTest('Performance sanity', this.testPerformance.bind(this));
 
@@ -247,6 +248,25 @@ class TestRunner {
         }
     }
 
+    async testSuggestConsolidations() {
+        if (!this.semantic) return { skipped: true, reason: '(needs embeddings)' };
+        const proj = 'sugg' + Date.now();
+        // Two phrasings of the same fact (an "update"): semantically close but too
+        // far apart to auto-consolidate. Plus an unrelated memory. The two should
+        // cluster as a consolidation candidate; the unrelated one should not join.
+        await this.db.storeMemory('we deploy the api to AWS using terraform', { project: proj });
+        await this.db.storeMemory('the api deployment now runs on AWS via terraform scripts', { project: proj });
+        await this.db.storeMemory('the office coffee machine is broken again', { project: proj });
+        const res = await this.db.suggestConsolidations({ project: proj, threshold: 0.55, scan: 50 });
+        this.assert(res.available, 'suggestConsolidations should be available with embeddings on');
+        // This also proves stored vectors can be read back (blobToF32); a failure
+        // there would yield zero clusters.
+        const group = res.groups.find(g => g.size >= 2);
+        this.assert(group, 'expected a cluster of >= 2 similar memories');
+        this.assert(!group.memories.some(m => m.content.includes('coffee')),
+            'unrelated memory should not be clustered with the deploy memories');
+    }
+
     async testDegradation() {
         // A DB with embeddings forced off must still store + search via FTS.
         const db2 = new MemoryDB({ dbPath: this._tmp('degraded'), embedder: NULL_EMBEDDER });
@@ -272,7 +292,7 @@ class TestRunner {
             'configure_logging', 'get_logs', 'list_projects_sessions', 'get_memory', 'delete_memory',
             'store_memories_batch', 'update_memory', 'list_memories', 'export_memories',
             'import_memories', 'rename_project', 'backup_database', 'delete_memories_where',
-            'find_similar', 'tag_memory'
+            'find_similar', 'tag_memory', 'suggest_consolidations'
         ];
         const registered = Object.keys(server.server._registeredTools || {});
         for (const tool of required) {

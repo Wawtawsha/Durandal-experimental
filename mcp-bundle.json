@@ -38,6 +38,7 @@
       "find_similar",
       "list_projects_sessions",
       "tag_memory",
+      "suggest_consolidations",
       "optimize_memory",
       "backup_database",
       "get_status",

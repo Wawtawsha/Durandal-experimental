@@ -166,7 +166,7 @@ path; see "Not in scope").
 
 | Capability | Notes |
 |---|---|
-| `tools` (20)  | Zod-validated; many declare `outputSchema` for typed responses |
+| `tools` (21)  | Zod-validated; many declare `outputSchema` for typed responses |
 | `resources`   | `durandal://memory/{id}` + list of 100 most recent |
 | `prompts`     | `summarize_recent_memories` |
 | `logging`     | `notifications/message` emitted per tool call |
@@ -182,6 +182,7 @@ path; see "Not in scope").
 `rename_project`, `delete_memories_where` (filter required).
 
 **Discovery:** `find_similar` (semantic KNN, lexical fallback),
+`suggest_consolidations` (cluster similar memories for client-side review),
 `list_projects_sessions`, `tag_memory`.
 
 **Admin:** `optimize_memory` (`vacuum`/`analyze`/`integrity_check`/

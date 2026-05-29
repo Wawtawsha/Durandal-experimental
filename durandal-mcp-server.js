@@ -553,6 +553,33 @@ class DurandalMCPServer extends EventEmitter {
             annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
         }, this.handleTagMemory);
 
+        R('suggest_consolidations', {
+            title: 'Suggest Consolidations',
+            description: 'Find clusters of semantically similar ACTIVE memories (same project) that may be duplicates, updates, or contradictions — for YOU to review and resolve using update_memory / delete_memory / store_memory. Read-only: it suggests candidates, it does not merge anything. Catches related memories that are too far apart for the automatic near-duplicate consolidation that runs on store.',
+            inputSchema: {
+                project: z.string().optional(),
+                similarity_threshold: z.number().min(0).max(1).optional().default(0.6).describe('Cosine similarity at/above which two memories are clustered as candidates'),
+                limit: z.number().int().min(1).max(50).optional().default(10),
+                scan: z.number().int().min(2).max(2000).optional().default(300).describe('How many of the most recent active memories to scan')
+            },
+            outputSchema: {
+                available: z.boolean(),
+                scanned: z.number().int(),
+                count: z.number().int(),
+                groups: z.array(z.object({
+                    project: z.string(),
+                    size: z.number().int(),
+                    memories: z.array(z.object({
+                        id: z.number().int(),
+                        content: z.string(),
+                        created_at: z.string(),
+                        importance: z.number().nullable()
+                    }))
+                }))
+            },
+            annotations: { readOnlyHint: true, openWorldHint: false }
+        }, this.handleSuggestConsolidations);
+
         // --- MCP resources: each memory is addressable as durandal://memory/{id} ---
         // Using a ResourceTemplate so clients can list and discover memories
         // without the server pre-enumerating them all.
@@ -1416,6 +1443,45 @@ class DurandalMCPServer extends EventEmitter {
                     relevance: r.relevance ?? null
                 }))
             }
+        };
+    }
+
+    async handleSuggestConsolidations(args, requestId) {
+        this.logger.processing('Processing suggest_consolidations request');
+        const res = await this.db.suggestConsolidations({
+            project: args.project,
+            threshold: args.similarity_threshold ?? 0.6,
+            limit: args.limit ?? 10,
+            scan: args.scan ?? 300
+        });
+
+        if (!res.available) {
+            return {
+                content: [{ type: 'text', text: 'Semantic consolidation is unavailable (embeddings are off). No suggestions.' }],
+                structuredContent: { available: false, scanned: 0, count: 0, groups: [] }
+            };
+        }
+        if (!res.groups.length) {
+            return {
+                content: [{ type: 'text', text: `No consolidation candidates found (scanned ${res.scanned} memories).` }],
+                structuredContent: { available: true, scanned: res.scanned, count: 0, groups: [] }
+            };
+        }
+
+        const text = res.groups.map((g, i) => {
+            const lines = g.memories.map(m => {
+                const c = m.content.length > 120 ? m.content.slice(0, 120) + '…' : m.content;
+                return `   - [${m.id}] ${c}`;
+            }).join('\n');
+            return `**Group ${i + 1}** — project "${g.project}", ${g.size} similar memories:\n${lines}`;
+        }).join('\n\n');
+
+        return {
+            content: [{
+                type: 'text',
+                text: `Found ${res.groups.length} cluster(s) of similar memories (scanned ${res.scanned}). For each group decide: duplicates (delete the extras), an update (refresh the current one and delete the stale), or genuinely distinct (leave them). Resolve with update_memory / delete_memory / store_memory.\n\n${text}`
+            }],
+            structuredContent: { available: true, scanned: res.scanned, count: res.groups.length, groups: res.groups }
         };
     }
 

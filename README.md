@@ -70,7 +70,7 @@ Just talk to Claude Code naturally — it calls the tools for you:
 **Bulk:** `store_memories_batch`, `export_memories`, `import_memories`,
 `rename_project`, `delete_memories_where`
 
-**Discovery:** `find_similar` (semantic), `list_projects_sessions`, `tag_memory`
+**Discovery:** `find_similar` (semantic), `suggest_consolidations` (review similar memories for cleanup), `list_projects_sessions`, `tag_memory`
 
 **Admin:** `optimize_memory` (vacuum/analyze/integrity_check/wal_checkpoint/
 backfill_embeddings), `backup_database`, `get_status`, `configure_logging`,

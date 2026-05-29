@@ -177,6 +177,9 @@ class MemoryDB {
     }
 
     _initCore() {
+        // Indexes that reference the v4 columns (superseded_by) are created in
+        // _migrate(), AFTER the columns are guaranteed to exist. Creating them
+        // here would throw on a pre-v4 table that predates those columns.
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,7 +190,6 @@ class MemoryDB {
                 superseded_by INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
-            CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded_by);
             CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(json_extract(metadata, '$.project')) WHERE json_extract(metadata, '$.project') IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(json_extract(metadata, '$.session')) WHERE json_extract(metadata, '$.session') IS NOT NULL;
         `);
@@ -203,6 +205,9 @@ class MemoryDB {
         if (!cols.includes('superseded_by')) {
             try { this.db.exec(`ALTER TABLE memories ADD COLUMN superseded_by INTEGER`); } catch (_) {}
         }
+        // superseded_by now exists (fresh CREATE or the ALTER above), so its index
+        // is safe to create — for both fresh and migrated pre-v4 databases.
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded_by)`);
     }
 
     _initFts() {

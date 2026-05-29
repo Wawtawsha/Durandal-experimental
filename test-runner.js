@@ -73,6 +73,7 @@ class TestRunner {
 
         await this.runTest('Database connection', this.testConnection.bind(this));
         await this.runTest('Schema + indexes (incl. vec table)', this.testSchema.bind(this));
+        await this.runTest('Pre-v4 DB migrates non-destructively', this.testMigration.bind(this));
         await this.runTest('Store + get round-trip', this.testStoreGet.bind(this));
         await this.runTest('Lexical search (exact tokens)', this.testLexical.bind(this));
         await this.runTest('Semantic recall (paraphrase)', this.testSemantic.bind(this));
@@ -140,6 +141,34 @@ class TestRunner {
         this.assert(this.db.ftsAvailable, 'FTS5 should be available');
         if (this.semantic) {
             this.assert(tables.includes('vec_memories'), 'missing vec_memories table when semantic enabled');
+        }
+    }
+
+    async testMigration() {
+        // Build a real pre-v4 database: only the original 4 columns + a row, no
+        // updated_at/superseded_by/vec table. Opening it with v4 must migrate it
+        // non-destructively and keep working. (Regression guard: v4's superseded_by
+        // index must be created AFTER the column is added on an existing table.)
+        const Database = require('better-sqlite3');
+        const p = this._tmp('prev4');
+        const raw = new Database(p);
+        raw.exec(`CREATE TABLE memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL,
+            metadata TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`);
+        raw.prepare('INSERT INTO memories(content, metadata) VALUES (?, ?)')
+            .run('legacy memory about postgres index tuning', JSON.stringify({ project: 'old' }));
+        raw.close();
+
+        const db = new MemoryDB({ dbPath: p, embedder: NULL_EMBEDDER });
+        try {
+            const cols = db.tableColumns('memories');
+            this.assert(cols.includes('superseded_by') && cols.includes('updated_at'), 'migration did not add v4 columns');
+            const got = db.getMemoryById(1);
+            this.assert(got && got.content.includes('postgres index tuning'), 'legacy row not readable after migration');
+            const { results } = await db.searchMemories('postgres', { project: 'old' });
+            this.assert(results.length === 1, 'lexical search broke after migration');
+        } finally {
+            db.close();
         }
     }
 
